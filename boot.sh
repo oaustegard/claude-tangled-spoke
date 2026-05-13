@@ -1,17 +1,14 @@
 #!/bin/bash
 # Boot hook for Claude Code on the Web.
-# Wires SSH so `git clone/push/pull` against Tangled Just Works, installs the
-# bundled `tg` CLI, and logs into the user's PDS with their app password.
+# Installs the bundled `tg` CLI and logs into the user's PDS with their app
+# password. SSH/git-push plumbing is intentionally absent: CCotw blocks
+# outbound port 22, and Tangled contributions can happen patch-based via
+# `tg pr create` (which uploads the patch as a PDS blob). For branch-based
+# PRs that need a real push, do it from a machine with SSH egress.
 #
 # Required env (from .env, gitignored):
 #   ATPROTO_HANDLE       — e.g. alice.bsky.social or alice.tngl.sh
 #   ATPROTO_APP_PASSWORD — app password from Bluesky settings (NOT main password)
-#
-# Optional env:
-#   TANGLED_SSH_KEY      — full SSH private key (PEM). If unset, boot looks for
-#                          $PROJECT_DIR/.ssh/id_ed25519.
-#   GH_TOKEN             — only used for fetching the spoke template from a
-#                          GitHub mirror; not required.
 
 set -e
 
@@ -30,31 +27,6 @@ for i in 1 2 3 4; do
     curl -sf --max-time 5 -o /dev/null "https://tangled.org" && break
     sleep $((i * 2))
 done
-
-# ── SSH setup ──
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-# Pin tangled.org's host key so first push doesn't prompt. We pull it live
-# instead of hard-coding so a future host key rotation doesn't brick the boot.
-if [ ! -s ~/.ssh/known_hosts ] || ! grep -q '^tangled\.org ' ~/.ssh/known_hosts; then
-    ssh-keyscan -t ed25519,rsa tangled.org 2>/dev/null >> ~/.ssh/known_hosts || true
-fi
-chmod 600 ~/.ssh/known_hosts 2>/dev/null || true
-
-KEYFILE=~/.ssh/id_ed25519
-if [ -n "${TANGLED_SSH_KEY:-}" ]; then
-    printf '%s\n' "$TANGLED_SSH_KEY" > "$KEYFILE"
-    chmod 600 "$KEYFILE"
-    summary "✓ SSH key installed from TANGLED_SSH_KEY"
-elif [ -f "$PROJECT_DIR/.ssh/id_ed25519" ]; then
-    cp "$PROJECT_DIR/.ssh/id_ed25519" "$KEYFILE"
-    chmod 600 "$KEYFILE"
-    summary "✓ SSH key installed from $PROJECT_DIR/.ssh/id_ed25519"
-else
-    summary "⚠ No SSH key found — git push to Tangled will fail until one is added"
-fi
-
-# Map https://tangled.org/... clone URLs to ssh, so `git clone https://...` works.
-git config --global "url.git@tangled.org:.insteadOf" "https://tangled.org/" 2>/dev/null || true
 
 # ── Install tg ──
 TG_BIN="$PROJECT_DIR/bin/tg"

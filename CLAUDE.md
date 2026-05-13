@@ -8,10 +8,9 @@ git host built on ATProto.
 
 After `SessionStart`, you have:
 
-- `git` over SSH to `tangled.org` (clone, push, pull) — assuming a key was
-  provisioned. https://tangled.org/... URLs are rewritten to SSH via
-  `git config --global url.git@tangled.org:.insteadOf https://tangled.org/`
 - `tg` CLI on `$PATH`, already logged into the user's PDS
+- Read-only `git clone https://tangled.org/...` (HTTPS) works out of the box
+- No SSH plumbing — see "CCotw networking quirk" below for why
 
 ## Hub/spoke model
 
@@ -118,8 +117,9 @@ denying it (`.claude/settings.json`) keeps Claude from reaching for it.
 - The session JWT is stored at `~/.config/tg/session.json` with mode `0600`.
   It's regenerated each session by `boot.sh`, so the stored copy is
   ephemeral — no long-lived secret on disk.
-- The SSH private key, if used, lands at `~/.ssh/id_ed25519` (mode `0600`).
-  Source it from `$TANGLED_SSH_KEY` or `$PROJECT_DIR/.ssh/id_ed25519`.
+- `boot.sh` does not install or touch SSH keys. If you need to push to
+  Tangled from a machine with SSH egress, manage `~/.ssh` yourself there
+  and register the public key once via `tg ssh-key add ~/.ssh/id_ed25519.pub`.
 
 ## What's NOT here (use the Tangled web UI)
 
@@ -134,14 +134,24 @@ denying it (`.claude/settings.json`) keeps Claude from reaching for it.
 
 CCotw containers reach tangled.org on 443 (HTTPS) but **not on port 22**.
 This is a blanket Anthropic egress rule — `github.com:22` and
-`gitlab.com:22` are blocked too, not just Tangled. Net effect:
+`gitlab.com:22` are blocked too, not just Tangled. Since `git push` to
+Tangled requires SSH, **`boot.sh` does not set up SSH at all**: previous
+versions installed a key and a global `url.git@tangled.org:.insteadOf
+https://tangled.org/` rule that actively broke read-only HTTPS clones
+(the rewrite forced every clone through port 22, which then failed).
+
+Net effect of the current boot:
 
 - ✓ `tg repo list/view/create/clone` — fine (all HTTPS/XRPC)
 - ✓ `tg issue/pr` reads and writes — fine (XRPC to PDS)
-- ✓ `git clone https://tangled.org/...` — fine (read-only HTTPS)
+- ✓ `git clone https://tangled.org/...` — fine (read-only HTTPS, no
+  `insteadOf` rewrite in the way)
+- ✓ `tg pr create` — uploads the patch as a PDS blob, no push needed; this
+  is the in-session contribution path
 - ✓ `tg repo create --source <url>` — **the knot pulls from the URL**
-  server-side over HTTPS, no SSH required from CCotw. Tested with GitHub.
-- ✗ `git push` to a Tangled remote from CCotw — fails (port 22 blocked)
+  server-side over HTTPS, no SSH required from CCotw
+- ✗ `git push` to a Tangled remote from CCotw — fails (port 22 blocked);
+  do branch-based pushes from a machine with SSH egress instead
 
 For populating a Tangled repo from CCotw, use `--source`:
 
@@ -150,7 +160,9 @@ tg repo create my-mirror --source https://github.com/me/my-repo.git
 ```
 
 For ongoing pushes after creation, do them from a machine with SSH egress
-(your laptop or a GitHub Action with an SSH key secret).
+(your laptop or a GitHub Action with an SSH key secret). Register the
+public key once via `tg ssh-key add ~/.ssh/id_ed25519.pub` from any
+authenticated session.
 
 ### Upstream bug to know about
 
