@@ -9,6 +9,10 @@
 # Required env (from .env, gitignored):
 #   ATPROTO_HANDLE       — e.g. alice.bsky.social or alice.tngl.sh
 #   ATPROTO_APP_PASSWORD — app password from Bluesky settings (NOT main password)
+#
+# CCotw also exposes BSKY_HANDLE / BSKY_APP_PASSWORD; we accept those as a
+# fallback so a stock CCotw session authenticates without manual remapping.
+# ATPROTO_* wins if both are set.
 
 set -e
 
@@ -45,15 +49,17 @@ else
 fi
 
 # ── Auth login ──
+: "${ATPROTO_HANDLE:=${BSKY_HANDLE:-}}"
+: "${ATPROTO_APP_PASSWORD:=${BSKY_APP_PASSWORD:-}}"
 if [ -n "${ATPROTO_HANDLE:-}" ] && [ -n "${ATPROTO_APP_PASSWORD:-}" ]; then
     if command -v tg >/dev/null && tg auth login --handle "$ATPROTO_HANDLE" >/dev/null 2>&1 <<< "$ATPROTO_APP_PASSWORD"; then
         WHO=$(tg auth status 2>/dev/null | head -1 | sed 's/^Handle: //')
         summary "✓ Logged in as $WHO"
     else
-        summary "⚠ tg auth login failed — check ATPROTO_HANDLE/ATPROTO_APP_PASSWORD"
+        summary "⚠ tg auth login failed — check ATPROTO_HANDLE/ATPROTO_APP_PASSWORD (or BSKY_HANDLE/BSKY_APP_PASSWORD)"
     fi
 else
-    summary "⚠ ATPROTO_HANDLE or ATPROTO_APP_PASSWORD missing — 'tg' will be unauthenticated"
+    summary "⚠ no ATPROTO_HANDLE/ATPROTO_APP_PASSWORD (or BSKY_HANDLE/BSKY_APP_PASSWORD) — 'tg' will be unauthenticated"
 fi
 
 # ── Print summary into Claude's context ──
