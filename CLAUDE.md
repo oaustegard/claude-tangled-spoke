@@ -24,17 +24,38 @@ tg repo list <handle>
 tg repo view <owner>/<name>
 tg issue list --repo <owner>/<name>
 tg pr list --repo <owner>/<name>
-tg pr view --repo <owner>/<name> <#n>
-tg pr patch --repo <owner>/<name> <#n>      # prints the latest round's diff
+tg pr view --repo <owner>/<name> <rkey>
+tg pr patch --repo <owner>/<name> <rkey>    # prints the latest round's diff
 
 # Write paths — need a logged-in session (boot.sh handles this)
 tg issue create  --repo <owner>/<name> --title "..." --body "..."
-tg issue comment --repo <owner>/<name> <#n> --body "..."
-tg issue close   --repo <owner>/<name> <#n>
-tg pr comment    --repo <owner>/<name> <#n> --body "..."
+tg issue comment --repo <owner>/<name> <rkey> --body "..."
+tg issue close   --repo <owner>/<name> <rkey>
+tg pr comment    --repo <owner>/<name> <rkey> --body "..."
 tg pr create     --repo <owner>/<name> --from <branch> --base main --title "..."
 tg ssh-key add ~/.ssh/id_ed25519.pub --name <label>
 ```
+
+### About identifiers — rkeys, not numbers
+
+`tg` reads issues and PRs through the **Constellation** backlink index, which
+indexes ATProto records directly off PDSes. That layer gives us rkeys (the
+13-char trailing path segment of an at-uri) but not the sequential issue/PR
+*numbers* you see in Tangled's web UI — those are assigned by **AppView**
+when it ingests records into its own database. There can be a noticeable lag
+between record creation and AppView ingestion (sometimes hours; sometimes
+records appear not to get numbered at all if AppView filters them).
+
+Implication for `tg`:
+
+- We display the rkey, e.g. `3mkux6xc5n22k`. It's stable, durable, and unique.
+- We do NOT display anything like `#3`. Earlier versions did — that was a
+  local Python `enumerate()` counter from whatever Constellation happened to
+  return in this session, never anything Tangled itself uses. The web URL
+  pattern `tangled.org/<owner>/<repo>/issues/<N>` takes the AppView number,
+  not the rkey, so rkey-based URLs don't resolve.
+- To find the canonical issue/PR number on the web, browse
+  `tangled.org/<owner>/<repo>/issues` once AppView has caught up.
 
 ### Spoke clone convention: `.spokes/`
 

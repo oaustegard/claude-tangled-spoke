@@ -211,7 +211,11 @@ class ListRepoIssuesMockedTests(unittest.TestCase):
 
         self.assertEqual([i["title"] for i in issues], ["First", "Second"])
         self.assertEqual([i["state"] for i in issues], ["closed", "open"])
-        self.assertEqual([i["number"] for i in issues], [1, 2])
+        # No fake sequential `number` field — identity comes from rkey/uri.
+        # (Tangled's canonical issue numbers come from AppView, not records.)
+        for i in issues:
+            self.assertNotIn("number", i)
+            self.assertTrue(i["uri"].startswith("at://"))
 
 
 class RepoCreateMockedTests(unittest.TestCase):
@@ -267,6 +271,20 @@ class RepoCreateMockedTests(unittest.TestCase):
         # `git clone --bare <url>` server-side over HTTPS.
         self.assertEqual(body["source"], url)
         self.assertEqual(body["name"], "demo")
+
+
+class IdentifierHelperTests(unittest.TestCase):
+    def test_rkey_from_uri(self):
+        self.assertEqual(
+            tg._rkey_from_uri("at://did:plc:abc/sh.tangled.repo.issue/3mlp5qwdg4g25"),
+            "3mlp5qwdg4g25",
+        )
+
+    def test_rkey_from_repo_uri(self):
+        self.assertEqual(
+            tg._rkey_from_uri("at://did:plc:abc/sh.tangled.repo/3mkunj73ac422"),
+            "3mkunj73ac422",
+        )
 
 
 class ParserSmokeTests(unittest.TestCase):

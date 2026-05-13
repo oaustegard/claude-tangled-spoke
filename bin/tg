@@ -9,13 +9,19 @@ the Web. Stdlib only — no third-party dependencies.
 
 Coverage:
   auth      login | logout | status | refresh | token
-  repo      list | view | clone
+  repo      list | view | clone | create  (create accepts --source for
+                                            server-side clone-from-URL)
   issue     list | view | create | comment | close | reopen
   pr        list | view | comment | patch | create
   ssh-key   list | add | delete
 
+Identifiers: tg displays the at-uri rkey (the durable ATProto identifier)
+plus a constructed `tangled.org/<owner>/<repo>/issues/<rkey>` web URL.
+It does NOT mint sequential issue numbers — those come from AppView, and
+records may exist on PDS/Constellation before AppView has assigned one.
+
 Not yet covered (use the web UI at https://tangled.org for these):
-  pr merge, pr close/reopen, pr checkout, repo create.
+  pr merge, pr close/reopen, pr checkout.
 """
 
 from __future__ import annotations
@@ -555,9 +561,19 @@ def list_repo_issues(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
             "created_at": v.get("createdAt", ""),
         })
     out.sort(key=lambda i: i["created_at"])
-    for i, item in enumerate(out, 1):
-        item["number"] = i
     return out
+
+
+def _rkey_from_uri(uri: str) -> str:
+    return uri.rsplit("/", 1)[-1]
+
+
+# NOTE on web URLs: Tangled's canonical issue/PR URL is
+# /<owner>/<repo>/issues/<N> where N is an AppView-assigned sequential number,
+# not the rkey. `tg` reads issues via Constellation backlinks, which surface
+# records before AppView has numbered them, so a rkey-derived URL would 404.
+# We display the rkey (durable) and the at-uri (verifiable). Users can browse
+# /<owner>/<repo>/issues in the web UI once AppView has caught up.
 
 
 def cmd_issue_list(args: argparse.Namespace) -> int:
@@ -572,22 +588,24 @@ def cmd_issue_list(args: argparse.Namespace) -> int:
         print("No issues.")
         return 0
     for i in issues:
-        print(f"#{i['number']:<4} {i['state']:<6}  {i['title']}")
+        rkey = _rkey_from_uri(i["uri"])
+        print(f"{rkey}  {i['state']:<6}  {i['title']}")
     return 0
 
 
 def _resolve_issue(repo: dict, ident: str) -> dict:
+    """Resolve an issue by at-uri or by rkey (the trailing path component)."""
     issues = list_repo_issues(repo["uri"], limit=200)
     if ident.startswith("at://"):
         for i in issues:
             if i["uri"] == ident:
                 return i
         sys.exit(f"tg: issue not found: {ident}")
-    n = int(ident.lstrip("#"))
+    # Match by rkey (case-sensitive substring after the last slash of the uri)
     for i in issues:
-        if i["number"] == n:
+        if _rkey_from_uri(i["uri"]) == ident:
             return i
-    sys.exit(f"tg: issue #{n} not found")
+    sys.exit(f"tg: issue {ident!r} not found (pass rkey or at-uri)")
 
 
 def cmd_issue_view(args: argparse.Namespace) -> int:
@@ -596,9 +614,9 @@ def cmd_issue_view(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(issue, indent=2))
         return 0
-    print(f"#{issue['number']}  [{issue['state']}]  {issue['title']}")
+    print(f"[{issue['state']}]  {issue['title']}")
     print(f"by {issue['author']} on {issue['created_at']}")
-    print(f"{issue['uri']}")
+    print(f"  {issue['uri']}")
     print()
     print(issue["body"] or "(no body)")
     # Comments
@@ -704,8 +722,6 @@ def list_repo_pulls(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
             "rounds": v.get("rounds", []),
         })
     out.sort(key=lambda p: p["created_at"])
-    for i, item in enumerate(out, 1):
-        item["number"] = i
     return out
 
 
@@ -722,22 +738,23 @@ def cmd_pr_list(args: argparse.Namespace) -> int:
         return 0
     for p in pulls:
         arrow = f"{p['source_branch'] or '?'} → {p['target_branch'] or '?'}"
-        print(f"#{p['number']:<4} {p['status']:<8}  {p['title']}  ({arrow})")
+        rkey = _rkey_from_uri(p["uri"])
+        print(f"{rkey}  {p['status']:<8}  {p['title']}  ({arrow})")
     return 0
 
 
 def _resolve_pull(repo: dict, ident: str) -> dict:
+    """Resolve a pull by at-uri or by rkey."""
     pulls = list_repo_pulls(repo["uri"], limit=200)
     if ident.startswith("at://"):
         for p in pulls:
             if p["uri"] == ident:
                 return p
         sys.exit(f"tg: pull not found: {ident}")
-    n = int(ident.lstrip("#"))
     for p in pulls:
-        if p["number"] == n:
+        if _rkey_from_uri(p["uri"]) == ident:
             return p
-    sys.exit(f"tg: pull #{n} not found")
+    sys.exit(f"tg: pull {ident!r} not found (pass rkey or at-uri)")
 
 
 def cmd_pr_view(args: argparse.Namespace) -> int:
@@ -746,11 +763,11 @@ def cmd_pr_view(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(pull, indent=2))
         return 0
-    print(f"#{pull['number']}  [{pull['status']}]  {pull['title']}")
+    print(f"[{pull['status']}]  {pull['title']}")
     print(f"by {pull['author']} on {pull['created_at']}")
     print(f"{pull['source_branch'] or '?'} → {pull['target_branch'] or '?'}")
     print(f"rounds: {len(pull['rounds'])}")
-    print(f"{pull['uri']}")
+    print(f"  {pull['uri']}")
     print()
     print(pull["body"] or "(no body)")
     comments = constellation_links(pull["uri"], NSID_PULL_COMMENT, ".pull", limit=200)
@@ -943,16 +960,16 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--limit", type=int, default=50)
             sp.add_argument("--json", action="store_true")
         elif name == "view":
-            sp.add_argument("id", help="#NUMBER or at-uri")
+            sp.add_argument("id", help="rkey or at-uri")
             sp.add_argument("--json", action="store_true")
         elif name == "create":
             sp.add_argument("--title", required=True)
             sp.add_argument("--body", help="(or read from stdin)")
         elif name == "comment":
-            sp.add_argument("id", help="#NUMBER or at-uri")
+            sp.add_argument("id", help="rkey or at-uri")
             sp.add_argument("--body", help="(or read from stdin)")
         elif name in ("close", "reopen"):
-            sp.add_argument("id", help="#NUMBER or at-uri")
+            sp.add_argument("id", help="rkey or at-uri")
         sp.set_defaults(func=fn)
 
     pr = sub.add_parser("pr").add_subparsers(dest="sub", required=True)
