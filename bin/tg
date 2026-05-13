@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+"""tg — minimal CLI for Tangled (https://tangled.org).
+
+Talks ATProto XRPC directly to a user's PDS for auth, records, blobs.
+Reads PR/issue lists via a Constellation backlink index.
+
+Subset of onevcat/tang's surface, written for headless use in Claude Code on
+the Web. Stdlib only — no third-party dependencies.
+
+Coverage:
+  auth      login | logout | status | refresh | token
+  repo      list | view | clone
+  issue     list | view | create | comment | close | reopen
+  pr        list | view | comment | patch | create
+  ssh-key   list | add | delete
+
+Not yet covered (use the web UI at https://tangled.org for these):
+  pr merge, pr close/reopen, pr checkout, repo create.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import io
+import json
+import os
+import secrets
+import string
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+# ── Defaults (mirror tang's config) ─────────────────────────────────────────
+DEFAULT_APPVIEW       = "https://tangled.org"
+DEFAULT_CONSTELLATION = "https://constellation.microcosm.blue"
+DEFAULT_KNOT          = "knot1.tangled.sh"
+
+# Lexicon NSIDs
+NSID_REPO          = "sh.tangled.repo"
+NSID_ISSUE         = "sh.tangled.repo.issue"
+NSID_ISSUE_STATE   = "sh.tangled.repo.issue.state"
+NSID_ISSUE_COMMENT = "sh.tangled.repo.issue.comment"
+NSID_PULL          = "sh.tangled.repo.pull"
+NSID_PULL_STATUS   = "sh.tangled.repo.pull.status"
+NSID_PULL_COMMENT  = "sh.tangled.repo.pull.comment"
+NSID_PUBLIC_KEY    = "sh.tangled.publicKey"
+
+CONFIG_DIR  = Path(os.environ.get("TG_CONFIG_DIR", str(Path.home() / ".config" / "tg")))
+SESSION_PATH = CONFIG_DIR / "session.json"
+USER_AGENT  = "tg/0.1 (+https://github.com/oaustegard/claude-tangled-and-spoke)"
+
+
+# ── HTTP / XRPC helpers ─────────────────────────────────────────────────────
+
+class XRPCError(Exception):
+    def __init__(self, status: int, body: str, message: str = ""):
+        super().__init__(message or f"XRPC {status}: {body[:200]}")
+        self.status = status
+        self.body = body
+
+
+def _request(method: str, url: str, *, headers: dict[str, str] | None = None,
+             data: bytes | None = None, timeout: float = 30.0) -> tuple[int, bytes, dict]:
+    req = urllib.request.Request(url, method=method, data=data)
+    req.add_header("User-Agent", USER_AGENT)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers or {})
+
+
+def xrpc_get(host: str, method: str, *, params: dict[str, Any] | None = None,
+             token: str | None = None) -> dict:
+    qs = ""
+    if params:
+        flat = []
+        for k, v in params.items():
+            if v is None:
+                continue
+            if isinstance(v, list):
+                for item in v:
+                    flat.append((k, str(item)))
+            else:
+                flat.append((k, str(v)))
+        qs = "?" + urllib.parse.urlencode(flat)
+    url = f"{host.rstrip('/')}/xrpc/{method}{qs}"
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    status, body, _ = _request("GET", url, headers=headers)
+    if status >= 400:
+        raise XRPCError(status, body.decode("utf-8", "replace"))
+    return json.loads(body) if body else {}
+
+
+def xrpc_post(host: str, method: str, *, body: dict | bytes,
+              token: str | None = None,
+              content_type: str = "application/json") -> dict:
+    url = f"{host.rstrip('/')}/xrpc/{method}"
+    headers = {"Accept": "application/json", "Content-Type": content_type}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if isinstance(body, dict):
+        data = json.dumps(body).encode()
+    else:
+        data = body
+    status, resp_body, _ = _request("POST", url, headers=headers, data=data)
+    if status >= 400:
+        raise XRPCError(status, resp_body.decode("utf-8", "replace"))
+    return json.loads(resp_body) if resp_body else {}
+
+
+# ── Session ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class Session:
+    did: str
+    handle: str
+    pds: str
+    access_jwt: str
+    refresh_jwt: str
+
+    @classmethod
+    def load(cls) -> "Session":
+        if not SESSION_PATH.exists():
+            raise SystemExit("tg: not logged in. Run `tg auth login --handle <handle>`.")
+        data = json.loads(SESSION_PATH.read_text())
+        return cls(**data)
+
+    @classmethod
+    def load_or_none(cls) -> "Session | None":
+        try:
+            return cls.load()
+        except SystemExit:
+            return None
+
+    def save(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_PATH.write_text(json.dumps(asdict(self), indent=2))
+        os.chmod(SESSION_PATH, 0o600)
+
+    @staticmethod
+    def clear() -> None:
+        if SESSION_PATH.exists():
+            SESSION_PATH.unlink()
+
+
+# ── ATProto identity resolution ─────────────────────────────────────────────
+
+def resolve_handle(handle: str) -> tuple[str, str]:
+    """Return (did, pds_endpoint) for a handle."""
+    handle = handle.lstrip("@")
+    # Try handle's own server first via well-known, then bsky.social as fallback.
+    did = None
+    for resolver in (f"https://{handle.split('.', 1)[-1]}", "https://bsky.social",
+                     "https://public.api.bsky.app"):
+        try:
+            r = xrpc_get(resolver, "com.atproto.identity.resolveHandle",
+                         params={"handle": handle})
+            did = r.get("did")
+            if did:
+                break
+        except (XRPCError, urllib.error.URLError, OSError):
+            continue
+    if not did:
+        raise SystemExit(f"tg: could not resolve handle {handle!r}")
+    return did, resolve_did_pds(did)
+
+
+def resolve_did_pds(did: str) -> str:
+    """Look up the PDS endpoint for a DID via PLC directory or did:web."""
+    if did.startswith("did:plc:"):
+        url = f"https://plc.directory/{did}"
+    elif did.startswith("did:web:"):
+        host = did.removeprefix("did:web:").replace(":", "/")
+        url = f"https://{host}/.well-known/did.json"
+    else:
+        raise SystemExit(f"tg: unsupported DID method: {did}")
+    status, body, _ = _request("GET", url)
+    if status >= 400:
+        raise SystemExit(f"tg: DID lookup failed ({status}): {url}")
+    doc = json.loads(body)
+    for svc in doc.get("service", []):
+        if svc.get("id") in ("#atproto_pds", f"{did}#atproto_pds") and \
+                svc.get("type") == "AtprotoPersonalDataServer":
+            return svc["serviceEndpoint"].rstrip("/")
+    raise SystemExit(f"tg: no PDS endpoint in DID document for {did}")
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
+def cmd_auth_login(args: argparse.Namespace) -> int:
+    handle = args.handle or os.environ.get("ATPROTO_HANDLE") or input("Handle: ").strip()
+    if not handle:
+        sys.exit("tg: handle required")
+    password = (os.environ.get("ATPROTO_APP_PASSWORD")
+                or (sys.stdin.read().strip() if not sys.stdin.isatty() else None))
+    if not password:
+        import getpass
+        password = getpass.getpass("App password: ")
+    did, pds = resolve_handle(handle)
+    out = xrpc_post(pds, "com.atproto.server.createSession",
+                    body={"identifier": handle, "password": password})
+    sess = Session(did=out["did"], handle=out["handle"], pds=pds,
+                   access_jwt=out["accessJwt"], refresh_jwt=out["refreshJwt"])
+    sess.save()
+    print(f"Logged in as {sess.handle} ({sess.did})")
+    print(f"PDS: {sess.pds}")
+    return 0
+
+
+def cmd_auth_logout(_: argparse.Namespace) -> int:
+    Session.clear()
+    print("Logged out")
+    return 0
+
+
+def cmd_auth_status(_: argparse.Namespace) -> int:
+    sess = Session.load_or_none()
+    if not sess:
+        print("Not authenticated.")
+        return 1
+    print(f"Handle: {sess.handle}")
+    print(f"DID:    {sess.did}")
+    print(f"PDS:    {sess.pds}")
+    return 0
+
+
+def cmd_auth_refresh(_: argparse.Namespace) -> int:
+    sess = Session.load()
+    out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body={},
+                    token=sess.refresh_jwt)
+    sess.access_jwt = out["accessJwt"]
+    sess.refresh_jwt = out["refreshJwt"]
+    sess.save()
+    print("Refreshed.")
+    return 0
+
+
+def cmd_auth_token(_: argparse.Namespace) -> int:
+    print(Session.load().access_jwt)
+    return 0
+
+
+def with_refresh(sess: Session, fn):
+    """Call fn(); on 401, refresh once and retry."""
+    try:
+        return fn()
+    except XRPCError as e:
+        if e.status != 401:
+            raise
+        out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body={},
+                        token=sess.refresh_jwt)
+        sess.access_jwt = out["accessJwt"]
+        sess.refresh_jwt = out["refreshJwt"]
+        sess.save()
+        return fn()
+
+
+# ── Helpers: AT URI, TID rkeys ──────────────────────────────────────────────
+
+def parse_at_uri(uri: str) -> tuple[str, str, str]:
+    if not uri.startswith("at://"):
+        raise ValueError(f"not an at-uri: {uri}")
+    rest = uri.removeprefix("at://")
+    parts = rest.split("/", 2)
+    if len(parts) != 3:
+        raise ValueError(f"malformed at-uri: {uri}")
+    return parts[0], parts[1], parts[2]
+
+
+_TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz"
+
+
+def new_tid() -> str:
+    """Generate an ATProto TID rkey (timestamp-id, 13 chars, sortable)."""
+    micros = int(time.time() * 1_000_000)
+    bits = (micros << 10) | secrets.randbelow(1 << 10)
+    out = []
+    for _ in range(13):
+        out.append(_TID_ALPHABET[bits & 0x1F])
+        bits >>= 5
+    return "".join(reversed(out))
+
+
+def now_rfc3339() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ── PDS record helpers ──────────────────────────────────────────────────────
+
+def create_record(sess: Session, collection: str, record: dict,
+                  rkey: str | None = None) -> dict:
+    body: dict[str, Any] = {"repo": sess.did, "collection": collection,
+                            "record": record, "validate": False}
+    if rkey:
+        body["rkey"] = rkey
+    return with_refresh(sess, lambda: xrpc_post(
+        sess.pds, "com.atproto.repo.createRecord", body=body, token=sess.access_jwt))
+
+
+def put_record(sess: Session, collection: str, rkey: str, record: dict) -> dict:
+    return with_refresh(sess, lambda: xrpc_post(
+        sess.pds, "com.atproto.repo.putRecord",
+        body={"repo": sess.did, "collection": collection, "rkey": rkey,
+              "record": record, "validate": False},
+        token=sess.access_jwt))
+
+
+def delete_record(sess: Session, collection: str, rkey: str) -> None:
+    with_refresh(sess, lambda: xrpc_post(
+        sess.pds, "com.atproto.repo.deleteRecord",
+        body={"repo": sess.did, "collection": collection, "rkey": rkey},
+        token=sess.access_jwt))
+
+
+def get_record(pds: str, did: str, collection: str, rkey: str) -> dict:
+    return xrpc_get(pds, "com.atproto.repo.getRecord",
+                    params={"repo": did, "collection": collection, "rkey": rkey})
+
+
+def list_records(pds: str, did: str, collection: str, limit: int = 100) -> list[dict]:
+    out = xrpc_get(pds, "com.atproto.repo.listRecords",
+                   params={"repo": did, "collection": collection, "limit": limit})
+    return out.get("records", [])
+
+
+def upload_blob(sess: Session, data: bytes, content_type: str) -> dict:
+    out = with_refresh(sess, lambda: xrpc_post(
+        sess.pds, "com.atproto.repo.uploadBlob", body=data, token=sess.access_jwt,
+        content_type=content_type))
+    return out["blob"]
+
+
+# ── Constellation: backlink index ───────────────────────────────────────────
+
+def constellation_links(target: str, collection: str, path: str, limit: int = 100,
+                         constellation: str = DEFAULT_CONSTELLATION) -> list[dict]:
+    """GET <constellation>/links?... — not an XRPC method."""
+    qs = urllib.parse.urlencode({
+        "target": target, "collection": collection, "path": path, "limit": limit,
+    })
+    url = f"{constellation.rstrip('/')}/links?{qs}"
+    status, body, _ = _request("GET", url, headers={"Accept": "application/json"})
+    if status >= 400:
+        raise XRPCError(status, body.decode("utf-8", "replace"))
+    return json.loads(body).get("linking_records", [])
+
+
+# ── Repo helpers ────────────────────────────────────────────────────────────
+
+def _resolve_owner(owner: str) -> tuple[str, str]:
+    """owner may be a handle or did. Returns (did, pds)."""
+    if owner.startswith("did:"):
+        return owner, resolve_did_pds(owner)
+    return resolve_handle(owner)
+
+
+def _clone_host(knot: str) -> str:
+    return "tangled.org" if knot == "knot1.tangled.sh" else knot
+
+
+def _repo_record_to_dict(owner: str, owner_did: str, record_uri: str, value: dict) -> dict:
+    name = value.get("name", "")
+    knot = value.get("knot", DEFAULT_KNOT)
+    host = _clone_host(knot)
+    return {
+        "owner": owner, "owner_did": owner_did, "name": name,
+        "description": value.get("description", ""), "knot": knot,
+        "created_at": value.get("createdAt", ""), "uri": record_uri,
+        "clone_ssh": f"git@{host}:{owner}/{name}",
+        "clone_https": f"https://{host}/{owner}/{name}",
+    }
+
+
+def list_user_repos(owner: str) -> list[dict]:
+    did, pds = _resolve_owner(owner)
+    records = list_records(pds, did, NSID_REPO)
+    return [_repo_record_to_dict(owner, did, r["uri"], r["value"]) for r in records]
+
+
+def find_repo(owner: str, name: str) -> dict:
+    for r in list_user_repos(owner):
+        if r["name"] == name:
+            return r
+    sys.exit(f"tg: repo {owner}/{name} not found")
+
+
+def cmd_repo_list(args: argparse.Namespace) -> int:
+    owner = args.owner or Session.load().handle
+    repos = list_user_repos(owner)
+    if args.json:
+        print(json.dumps(repos, indent=2))
+        return 0
+    if not repos:
+        print(f"No repos for {owner}.")
+        return 0
+    width = max(len(r["name"]) for r in repos)
+    for r in repos:
+        desc = r["description"] or ""
+        print(f"{r['name']:<{width}}  {desc}")
+    return 0
+
+
+def cmd_repo_view(args: argparse.Namespace) -> int:
+    owner, name = _split_repo_arg(args.repo, default_owner=lambda: Session.load().handle)
+    repo = find_repo(owner, name)
+    if args.json:
+        print(json.dumps(repo, indent=2))
+    else:
+        print(f"Repo:        {repo['owner']}/{repo['name']}")
+        print(f"Description: {repo['description'] or '(none)'}")
+        print(f"Knot:        {repo['knot']}")
+        print(f"Created:     {repo['created_at']}")
+        print(f"URI:         {repo['uri']}")
+        print(f"Clone (SSH): {repo['clone_ssh']}")
+        print(f"Clone (HTTPS): {repo['clone_https']}")
+    return 0
+
+
+def cmd_repo_clone(args: argparse.Namespace) -> int:
+    owner, name = _split_repo_arg(args.repo, default_owner=lambda: Session.load().handle)
+    repo = find_repo(owner, name)
+    url = repo["clone_ssh"] if args.ssh else repo["clone_https"]
+    target = args.dir or name
+    print(f"Cloning {url} → {target}")
+    return subprocess.call(["git", "clone", url, target])
+
+
+def _split_repo_arg(arg: str, default_owner) -> tuple[str, str]:
+    if "/" in arg:
+        owner, name = arg.split("/", 1)
+    else:
+        owner, name = default_owner(), arg
+    return owner.lstrip("@"), name
+
+
+def _resolve_repo(repo_arg: str | None) -> dict:
+    if not repo_arg:
+        sys.exit("tg: --repo OWNER/NAME required")
+    sess_handle = Session.load_or_none().handle if SESSION_PATH.exists() else None
+    owner, name = _split_repo_arg(repo_arg, default_owner=lambda: sess_handle or sys.exit(
+        "tg: pass OWNER/NAME (no logged-in session to default the owner)"))
+    return find_repo(owner, name)
+
+
+# ── Issues ──────────────────────────────────────────────────────────────────
+
+def _normalize_state(value: str, prefix: str) -> str:
+    if value.startswith(prefix + "."):
+        return value.removeprefix(prefix + ".")
+    return value or "open"
+
+
+def _issue_state(issue_uri: str, constellation: str) -> str:
+    links = constellation_links(issue_uri, NSID_ISSUE_STATE, ".issue", limit=100,
+                                 constellation=constellation)
+    if not links:
+        return "open"
+    latest = sorted(links, key=lambda l: l.get("rkey", ""))[-1]
+    pds = resolve_did_pds(latest["did"])
+    rec = get_record(pds, latest["did"], NSID_ISSUE_STATE, latest["rkey"])
+    return _normalize_state(rec.get("value", {}).get("state", "open"), NSID_ISSUE_STATE)
+
+
+def list_repo_issues(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
+                     limit: int = 50) -> list[dict]:
+    links = constellation_links(repo_uri, NSID_ISSUE, ".repo", limit=limit,
+                                constellation=constellation)
+    out = []
+    for link in links:
+        try:
+            pds = resolve_did_pds(link["did"])
+            rec = get_record(pds, link["did"], NSID_ISSUE, link["rkey"])
+        except (XRPCError, SystemExit, urllib.error.URLError):
+            continue
+        v = rec.get("value", {})
+        uri = rec["uri"]
+        try:
+            state = _issue_state(uri, constellation)
+        except Exception:
+            state = "open"
+        out.append({
+            "uri": uri, "author": link["did"], "title": v.get("title", ""),
+            "body": v.get("body", ""), "state": state,
+            "created_at": v.get("createdAt", ""),
+        })
+    out.sort(key=lambda i: i["created_at"])
+    for i, item in enumerate(out, 1):
+        item["number"] = i
+    return out
+
+
+def cmd_issue_list(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    issues = list_repo_issues(repo["uri"], limit=args.limit)
+    if args.state and args.state != "all":
+        issues = [i for i in issues if i["state"] == args.state]
+    if args.json:
+        print(json.dumps(issues, indent=2))
+        return 0
+    if not issues:
+        print("No issues.")
+        return 0
+    for i in issues:
+        print(f"#{i['number']:<4} {i['state']:<6}  {i['title']}")
+    return 0
+
+
+def _resolve_issue(repo: dict, ident: str) -> dict:
+    issues = list_repo_issues(repo["uri"], limit=200)
+    if ident.startswith("at://"):
+        for i in issues:
+            if i["uri"] == ident:
+                return i
+        sys.exit(f"tg: issue not found: {ident}")
+    n = int(ident.lstrip("#"))
+    for i in issues:
+        if i["number"] == n:
+            return i
+    sys.exit(f"tg: issue #{n} not found")
+
+
+def cmd_issue_view(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    issue = _resolve_issue(repo, args.id)
+    if args.json:
+        print(json.dumps(issue, indent=2))
+        return 0
+    print(f"#{issue['number']}  [{issue['state']}]  {issue['title']}")
+    print(f"by {issue['author']} on {issue['created_at']}")
+    print(f"{issue['uri']}")
+    print()
+    print(issue["body"] or "(no body)")
+    # Comments
+    comments = constellation_links(issue["uri"], NSID_ISSUE_COMMENT, ".issue", limit=200)
+    if comments:
+        print("\n— comments —")
+        for link in comments:
+            try:
+                pds = resolve_did_pds(link["did"])
+                rec = get_record(pds, link["did"], NSID_ISSUE_COMMENT, link["rkey"])
+            except (XRPCError, SystemExit, urllib.error.URLError):
+                continue
+            v = rec.get("value", {})
+            print(f"\n{link['did']} @ {v.get('createdAt','')}")
+            print(v.get("body", ""))
+    return 0
+
+
+def cmd_issue_create(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    repo = _resolve_repo(args.repo)
+    body = args.body or (sys.stdin.read() if not sys.stdin.isatty() else "")
+    record = {
+        "$type": NSID_ISSUE, "repo": repo["uri"], "title": args.title,
+        "createdAt": now_rfc3339(),
+    }
+    if body:
+        record["body"] = body
+    out = create_record(sess, NSID_ISSUE, record)
+    print(f"Created: {out['uri']}")
+    return 0
+
+
+def cmd_issue_comment(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    repo = _resolve_repo(args.repo)
+    issue = _resolve_issue(repo, args.id)
+    body = args.body or (sys.stdin.read() if not sys.stdin.isatty() else "")
+    if not body:
+        sys.exit("tg: comment body required (--body or stdin)")
+    out = create_record(sess, NSID_ISSUE_COMMENT, {
+        "$type": NSID_ISSUE_COMMENT, "issue": issue["uri"], "body": body,
+        "createdAt": now_rfc3339(),
+    })
+    print(f"Commented: {out['uri']}")
+    return 0
+
+
+def _issue_set_state(args, state: str) -> int:
+    sess = Session.load()
+    repo = _resolve_repo(args.repo)
+    issue = _resolve_issue(repo, args.id)
+    create_record(sess, NSID_ISSUE_STATE, {
+        "$type": NSID_ISSUE_STATE, "issue": issue["uri"],
+        "state": f"{NSID_ISSUE_STATE}.{state}",
+    })
+    print(f"Issue #{issue['number']} → {state}")
+    return 0
+
+
+def cmd_issue_close(args):  return _issue_set_state(args, "closed")
+def cmd_issue_reopen(args): return _issue_set_state(args, "open")
+
+
+# ── Pull requests ───────────────────────────────────────────────────────────
+
+def _pull_status(pull_uri: str, constellation: str) -> str:
+    links = constellation_links(pull_uri, NSID_PULL_STATUS, ".pull", limit=100,
+                                 constellation=constellation)
+    if not links:
+        return "open"
+    latest = sorted(links, key=lambda l: l.get("rkey", ""))[-1]
+    pds = resolve_did_pds(latest["did"])
+    rec = get_record(pds, latest["did"], NSID_PULL_STATUS, latest["rkey"])
+    return _normalize_state(rec.get("value", {}).get("status", "open"), NSID_PULL_STATUS)
+
+
+def list_repo_pulls(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
+                    limit: int = 50) -> list[dict]:
+    links = constellation_links(repo_uri, NSID_PULL, ".target.repo", limit=limit,
+                                constellation=constellation)
+    out = []
+    for link in links:
+        try:
+            pds = resolve_did_pds(link["did"])
+            rec = get_record(pds, link["did"], NSID_PULL, link["rkey"])
+        except (XRPCError, SystemExit, urllib.error.URLError):
+            continue
+        v = rec.get("value", {})
+        uri = rec["uri"]
+        try:
+            status = _pull_status(uri, constellation)
+        except Exception:
+            status = "open"
+        target = v.get("target") or {}
+        source = v.get("source") or {}
+        out.append({
+            "uri": uri, "author": link["did"], "title": v.get("title", ""),
+            "body": v.get("body", ""), "status": status,
+            "created_at": v.get("createdAt", ""),
+            "target_branch": target.get("branch", ""),
+            "source_branch": source.get("branch", ""),
+            "rounds": v.get("rounds", []),
+        })
+    out.sort(key=lambda p: p["created_at"])
+    for i, item in enumerate(out, 1):
+        item["number"] = i
+    return out
+
+
+def cmd_pr_list(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    pulls = list_repo_pulls(repo["uri"], limit=args.limit)
+    if args.status and args.status != "all":
+        pulls = [p for p in pulls if p["status"] == args.status]
+    if args.json:
+        print(json.dumps(pulls, indent=2))
+        return 0
+    if not pulls:
+        print("No pull requests.")
+        return 0
+    for p in pulls:
+        arrow = f"{p['source_branch'] or '?'} → {p['target_branch'] or '?'}"
+        print(f"#{p['number']:<4} {p['status']:<8}  {p['title']}  ({arrow})")
+    return 0
+
+
+def _resolve_pull(repo: dict, ident: str) -> dict:
+    pulls = list_repo_pulls(repo["uri"], limit=200)
+    if ident.startswith("at://"):
+        for p in pulls:
+            if p["uri"] == ident:
+                return p
+        sys.exit(f"tg: pull not found: {ident}")
+    n = int(ident.lstrip("#"))
+    for p in pulls:
+        if p["number"] == n:
+            return p
+    sys.exit(f"tg: pull #{n} not found")
+
+
+def cmd_pr_view(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    pull = _resolve_pull(repo, args.id)
+    if args.json:
+        print(json.dumps(pull, indent=2))
+        return 0
+    print(f"#{pull['number']}  [{pull['status']}]  {pull['title']}")
+    print(f"by {pull['author']} on {pull['created_at']}")
+    print(f"{pull['source_branch'] or '?'} → {pull['target_branch'] or '?'}")
+    print(f"rounds: {len(pull['rounds'])}")
+    print(f"{pull['uri']}")
+    print()
+    print(pull["body"] or "(no body)")
+    comments = constellation_links(pull["uri"], NSID_PULL_COMMENT, ".pull", limit=200)
+    if comments:
+        print("\n— comments —")
+        for link in comments:
+            try:
+                pds = resolve_did_pds(link["did"])
+                rec = get_record(pds, link["did"], NSID_PULL_COMMENT, link["rkey"])
+            except (XRPCError, SystemExit, urllib.error.URLError):
+                continue
+            v = rec.get("value", {})
+            print(f"\n{link['did']} @ {v.get('createdAt','')}")
+            print(v.get("body", ""))
+    return 0
+
+
+def cmd_pr_comment(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    repo = _resolve_repo(args.repo)
+    pull = _resolve_pull(repo, args.id)
+    body = args.body or (sys.stdin.read() if not sys.stdin.isatty() else "")
+    if not body:
+        sys.exit("tg: comment body required (--body or stdin)")
+    out = create_record(sess, NSID_PULL_COMMENT, {
+        "$type": NSID_PULL_COMMENT, "pull": pull["uri"], "body": body,
+        "createdAt": now_rfc3339(),
+    })
+    print(f"Commented: {out['uri']}")
+    return 0
+
+
+def cmd_pr_patch(args: argparse.Namespace) -> int:
+    """Print the patch from the latest round of a PR."""
+    repo = _resolve_repo(args.repo)
+    pull = _resolve_pull(repo, args.id)
+    if not pull["rounds"]:
+        sys.exit("tg: pull has no rounds")
+    latest = pull["rounds"][-1]
+    blob = latest.get("patchBlob", {})
+    cid = blob.get("ref", {}).get("$link") or blob.get("ref")
+    if not cid:
+        sys.exit("tg: round has no patch blob")
+    pds = resolve_did_pds(pull["author"])
+    qs = urllib.parse.urlencode({"did": pull["author"], "cid": cid})
+    url = f"{pds.rstrip('/')}/xrpc/com.atproto.sync.getBlob?{qs}"
+    status, body, _ = _request("GET", url)
+    if status >= 400:
+        sys.exit(f"tg: getBlob failed ({status})")
+    sys.stdout.write(gzip.decompress(body).decode("utf-8", "replace"))
+    return 0
+
+
+def cmd_pr_create(args: argparse.Namespace) -> int:
+    """Create a patch-based PR from a local format-patch series."""
+    sess = Session.load()
+    repo = _resolve_repo(args.repo)
+    if args.patch:
+        patch_text = Path(args.patch).read_text()
+    elif args.from_branch:
+        # git format-patch <base>..<head> --stdout
+        base = args.base or "main"
+        try:
+            patch_text = subprocess.check_output(
+                ["git", "format-patch", f"{base}..{args.from_branch}", "--stdout"],
+                cwd=args.cwd or ".").decode()
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"tg: git format-patch failed: {e}")
+        if not patch_text.strip():
+            sys.exit(f"tg: no commits between {base} and {args.from_branch}")
+    else:
+        sys.exit("tg: pass --patch <file> or --from <branch>")
+    title = args.title
+    if not title:
+        for line in patch_text.splitlines():
+            if line.startswith("Subject: "):
+                title = line.removeprefix("Subject: ").strip()
+                title = title.removeprefix("[PATCH] ").removeprefix("[PATCH 1/1] ")
+                break
+    if not title:
+        sys.exit("tg: --title required (and no Subject: line found)")
+    body = args.body or ""
+    gz = gzip.compress(patch_text.encode())
+    blob = upload_blob(sess, gz, "application/gzip")
+    now = now_rfc3339()
+    record = {
+        "$type": NSID_PULL, "title": title, "createdAt": now,
+        "target": {"repo": repo["uri"], "branch": args.base or "main"},
+        "rounds": [{"createdAt": now, "patchBlob": blob}],
+    }
+    if body:
+        record["body"] = body
+    if args.from_branch:
+        record["source"] = {"repo": repo["uri"], "branch": args.from_branch}
+    if repo.get("owner_did"):
+        record["target"]["repoDid"] = repo["owner_did"]
+    out = create_record(sess, NSID_PULL, record, rkey=new_tid())
+    print(f"Pull created: {out['uri']}")
+    print(f"  → https://tangled.org/@{repo['owner']}/{repo['name']}/pulls")
+    return 0
+
+
+# ── SSH keys ────────────────────────────────────────────────────────────────
+
+def cmd_sshkey_list(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    keys = list_records(sess.pds, sess.did, NSID_PUBLIC_KEY)
+    if args.json:
+        print(json.dumps([{"uri": r["uri"], **r["value"]} for r in keys], indent=2))
+        return 0
+    if not keys:
+        print("No SSH keys.")
+        return 0
+    for r in keys:
+        v = r["value"]
+        rkey = r["uri"].rsplit("/", 1)[-1]
+        print(f"{rkey}\t{v.get('name','')}\t{v.get('key','')[:60]}…")
+    return 0
+
+
+def cmd_sshkey_add(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    key_text = Path(args.path).read_text().strip()
+    name = args.name or Path(args.path).stem
+    out = create_record(sess, NSID_PUBLIC_KEY, {
+        "$type": NSID_PUBLIC_KEY, "name": name, "key": key_text,
+        "createdAt": now_rfc3339(),
+    })
+    print(f"Added SSH key {name}: {out['uri']}")
+    return 0
+
+
+def cmd_sshkey_delete(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    delete_record(sess, NSID_PUBLIC_KEY, args.rkey)
+    print(f"Deleted SSH key {args.rkey}")
+    return 0
+
+
+# ── argparse wiring ─────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="tg", description="CLI for Tangled (https://tangled.org)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    auth = sub.add_parser("auth", help="manage authentication").add_subparsers(
+        dest="sub", required=True)
+    a_login = auth.add_parser("login")
+    a_login.add_argument("--handle", help="ATProto handle (or set ATPROTO_HANDLE)")
+    a_login.set_defaults(func=cmd_auth_login)
+    auth.add_parser("logout").set_defaults(func=cmd_auth_logout)
+    auth.add_parser("status").set_defaults(func=cmd_auth_status)
+    auth.add_parser("refresh").set_defaults(func=cmd_auth_refresh)
+    auth.add_parser("token").set_defaults(func=cmd_auth_token)
+
+    repo = sub.add_parser("repo").add_subparsers(dest="sub", required=True)
+    r_list = repo.add_parser("list")
+    r_list.add_argument("owner", nargs="?", help="handle or did (default: logged-in user)")
+    r_list.add_argument("--json", action="store_true")
+    r_list.set_defaults(func=cmd_repo_list)
+    r_view = repo.add_parser("view")
+    r_view.add_argument("repo", help="OWNER/NAME or NAME (uses logged-in handle)")
+    r_view.add_argument("--json", action="store_true")
+    r_view.set_defaults(func=cmd_repo_view)
+    r_clone = repo.add_parser("clone")
+    r_clone.add_argument("repo")
+    r_clone.add_argument("dir", nargs="?")
+    r_clone.add_argument("--ssh", action="store_true", help="use ssh url (default: https)")
+    r_clone.set_defaults(func=cmd_repo_clone)
+
+    issue = sub.add_parser("issue").add_subparsers(dest="sub", required=True)
+    for name, fn in [("list", cmd_issue_list), ("view", cmd_issue_view),
+                     ("create", cmd_issue_create), ("comment", cmd_issue_comment),
+                     ("close", cmd_issue_close), ("reopen", cmd_issue_reopen)]:
+        sp = issue.add_parser(name)
+        sp.add_argument("--repo", help="OWNER/NAME (default: from cwd .git/config — not yet)")
+        if name == "list":
+            sp.add_argument("--state", choices=["open", "closed", "all"], default="all")
+            sp.add_argument("--limit", type=int, default=50)
+            sp.add_argument("--json", action="store_true")
+        elif name == "view":
+            sp.add_argument("id", help="#NUMBER or at-uri")
+            sp.add_argument("--json", action="store_true")
+        elif name == "create":
+            sp.add_argument("--title", required=True)
+            sp.add_argument("--body", help="(or read from stdin)")
+        elif name == "comment":
+            sp.add_argument("id", help="#NUMBER or at-uri")
+            sp.add_argument("--body", help="(or read from stdin)")
+        elif name in ("close", "reopen"):
+            sp.add_argument("id", help="#NUMBER or at-uri")
+        sp.set_defaults(func=fn)
+
+    pr = sub.add_parser("pr").add_subparsers(dest="sub", required=True)
+    p_list = pr.add_parser("list")
+    p_list.add_argument("--repo")
+    p_list.add_argument("--status", choices=["open", "closed", "merged", "all"], default="all")
+    p_list.add_argument("--limit", type=int, default=50)
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_pr_list)
+    p_view = pr.add_parser("view")
+    p_view.add_argument("--repo")
+    p_view.add_argument("id")
+    p_view.add_argument("--json", action="store_true")
+    p_view.set_defaults(func=cmd_pr_view)
+    p_comment = pr.add_parser("comment")
+    p_comment.add_argument("--repo")
+    p_comment.add_argument("id")
+    p_comment.add_argument("--body")
+    p_comment.set_defaults(func=cmd_pr_comment)
+    p_patch = pr.add_parser("patch")
+    p_patch.add_argument("--repo")
+    p_patch.add_argument("id")
+    p_patch.set_defaults(func=cmd_pr_patch)
+    p_create = pr.add_parser("create",
+        help="create a patch-based pull (uploads format-patch as a blob)")
+    p_create.add_argument("--repo", required=True)
+    p_create.add_argument("--title")
+    p_create.add_argument("--body", default="")
+    p_create.add_argument("--base", default="main", help="target branch")
+    p_create.add_argument("--from", dest="from_branch",
+                          help="local branch to format-patch from <base>..")
+    p_create.add_argument("--patch", help="path to a .patch / .mbox file")
+    p_create.add_argument("--cwd", help="git repo dir for format-patch")
+    p_create.set_defaults(func=cmd_pr_create)
+
+    sk = sub.add_parser("ssh-key").add_subparsers(dest="sub", required=True)
+    sk_list = sk.add_parser("list")
+    sk_list.add_argument("--json", action="store_true")
+    sk_list.set_defaults(func=cmd_sshkey_list)
+    sk_add = sk.add_parser("add")
+    sk_add.add_argument("path", help="path to public key file")
+    sk_add.add_argument("--name")
+    sk_add.set_defaults(func=cmd_sshkey_add)
+    sk_del = sk.add_parser("delete")
+    sk_del.add_argument("rkey", help="rkey from `tg ssh-key list`")
+    sk_del.set_defaults(func=cmd_sshkey_delete)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except XRPCError as e:
+        print(f"tg: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

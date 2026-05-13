@@ -1,0 +1,9 @@
+.env
+.env.local
+*.env
+!.env.example
+.ssh/
+.spokes/
+.uploads/
+__pycache__/
+*.pyc
