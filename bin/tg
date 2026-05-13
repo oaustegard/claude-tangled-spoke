@@ -384,6 +384,7 @@ def _repo_record_to_dict(owner: str, owner_did: str, record_uri: str, value: dic
         "owner": owner, "owner_did": owner_did, "name": name,
         "description": value.get("description", ""), "knot": knot,
         "created_at": value.get("createdAt", ""), "uri": record_uri,
+        "repo_did": value.get("repoDid", ""),
         "clone_ssh": f"git@{host}:{owner}/{name}",
         "clone_https": f"https://{host}/{owner}/{name}",
     }
@@ -643,6 +644,10 @@ def cmd_issue_create(args: argparse.Namespace) -> int:
         "$type": NSID_ISSUE, "repo": repo["uri"], "title": args.title,
         "createdAt": now_rfc3339(),
     }
+    # AppView routes issues to a repo by the Knot's repoDid; without it the
+    # record is invisible to the web UI even though Constellation indexes it.
+    if repo.get("repo_did"):
+        record["repoDid"] = repo["repo_did"]
     if body:
         record["body"] = body
     out = create_record(sess, NSID_ISSUE, record)
@@ -673,7 +678,7 @@ def _issue_set_state(args, state: str) -> int:
         "$type": NSID_ISSUE_STATE, "issue": issue["uri"],
         "state": f"{NSID_ISSUE_STATE}.{state}",
     })
-    print(f"Issue #{issue['number']} → {state}")
+    print(f"Issue {_rkey_from_uri(issue['uri'])} → {state}")
     return 0
 
 
@@ -862,8 +867,8 @@ def cmd_pr_create(args: argparse.Namespace) -> int:
         record["body"] = body
     if args.from_branch:
         record["source"] = {"repo": repo["uri"], "branch": args.from_branch}
-    if repo.get("owner_did"):
-        record["target"]["repoDid"] = repo["owner_did"]
+    if repo.get("repo_did"):
+        record["target"]["repoDid"] = repo["repo_did"]
     out = create_record(sess, NSID_PULL, record, rkey=new_tid())
     print(f"Pull created: {out['uri']}")
     print(f"  → https://tangled.org/@{repo['owner']}/{repo['name']}/pulls")

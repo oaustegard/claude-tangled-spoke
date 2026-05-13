@@ -131,6 +131,26 @@ class RepoRecordToDictTests(unittest.TestCase):
         )
         self.assertEqual(out["clone_ssh"], "git@knot.example.com:alice/demo")
 
+    def test_carries_repo_did(self):
+        # AppView routes issue/PR records by repoDid (the Knot's DID, distinct
+        # from the owner DID). We have to surface it from the repo record so
+        # downstream writers can include it.
+        out = tg._repo_record_to_dict(
+            owner="alice", owner_did="did:plc:owner",
+            record_uri="at://did:plc:owner/sh.tangled.repo/r1",
+            value={"name": "demo", "knot": "knot1.tangled.sh",
+                   "repoDid": "did:plc:knothost"},
+        )
+        self.assertEqual(out["repo_did"], "did:plc:knothost")
+
+    def test_repo_did_defaults_to_empty(self):
+        out = tg._repo_record_to_dict(
+            owner="alice", owner_did="did:plc:owner",
+            record_uri="at://did:plc:owner/sh.tangled.repo/r1",
+            value={"name": "demo"},
+        )
+        self.assertEqual(out["repo_did"], "")
+
 
 class SessionRoundTripTests(unittest.TestCase):
     def test_save_load_clear(self):
@@ -271,6 +291,47 @@ class RepoCreateMockedTests(unittest.TestCase):
         # `git clone --bare <url>` server-side over HTTPS.
         self.assertEqual(body["source"], url)
         self.assertEqual(body["name"], "demo")
+
+
+class IssueCreateMockedTests(unittest.TestCase):
+    def _fake_repo(self, repo_did="did:plc:knothost"):
+        return {
+            "owner": "alice", "owner_did": "did:plc:owner", "name": "demo",
+            "uri": "at://did:plc:owner/sh.tangled.repo/r1",
+            "repo_did": repo_did, "knot": "knot1.tangled.sh",
+        }
+
+    def _run_create(self, repo, body=None):
+        sess = tg.Session(did="did:plc:owner", handle="alice", pds="https://pds",
+                          access_jwt="A", refresh_jwt="R")
+        written = {}
+
+        def fake_create_record(s, collection, record, rkey=None):
+            written["collection"] = collection
+            written["record"] = record
+            return {"uri": f"at://{s.did}/{collection}/xxxx", "cid": "bafy"}
+
+        argv = argparse.Namespace(repo="alice/demo", title="hi", body=body)
+        with mock.patch.object(tg.Session, "load", return_value=sess), \
+             mock.patch.object(tg, "_resolve_repo", return_value=repo), \
+             mock.patch.object(tg, "create_record", side_effect=fake_create_record), \
+             mock.patch.object(sys.stdin, "isatty", return_value=True):
+            rc = tg.cmd_issue_create(argv)
+        return rc, written
+
+    def test_includes_repo_did(self):
+        # The crux: AppView won't ingest the issue without repoDid on the record.
+        rc, written = self._run_create(self._fake_repo())
+        self.assertEqual(rc, 0)
+        self.assertEqual(written["record"]["repoDid"], "did:plc:knothost")
+        self.assertEqual(written["record"]["repo"],
+                         "at://did:plc:owner/sh.tangled.repo/r1")
+        self.assertEqual(written["record"]["title"], "hi")
+
+    def test_omits_repo_did_when_absent(self):
+        rc, written = self._run_create(self._fake_repo(repo_did=""))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("repoDid", written["record"])
 
 
 class IdentifierHelperTests(unittest.TestCase):
