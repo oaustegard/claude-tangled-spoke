@@ -390,9 +390,38 @@ def _repo_record_to_dict(owner: str, owner_did: str, record_uri: str, value: dic
     }
 
 
+def _is_proxy_pds_block(err: "XRPCError | OSError") -> bool:
+    """Detect egress-proxy refusals that indicate the PDS host is unreachable.
+
+    Common shapes from claude.ai's egress proxy:
+      - 'Host not in allowlist'                       (host literally not allowlisted)
+      - 'Host resolves to a private/reserved IP: …'  (SSRF protection on resolver)
+      - 'resolve_no_records'                          (DNS failure)
+    """
+    if not isinstance(err, XRPCError):
+        return False
+    body = err.body.lower()
+    return ("host not in allowlist" in body
+            or "private/reserved ip" in body
+            or "resolve_no_records" in body)
+
+
 def list_user_repos(owner: str) -> list[dict]:
     did, pds = _resolve_owner(owner)
-    records = list_records(pds, did, NSID_REPO)
+    try:
+        records = list_records(pds, did, NSID_REPO)
+    except XRPCError as e:
+        if _is_proxy_pds_block(e):
+            sys.exit(
+                f"tg: cannot reach {owner}'s PDS ({pds}) from this environment. "
+                f"The HTTP egress is refusing this host — this is an environment "
+                f"limit, not a Tangled or skill bug. Self-hosted PDSes outside the "
+                f"central infrastructure (e.g. mitchellh.com → pds.mitchellh.com) "
+                f"are not reachable from proxied environments like claude.ai. "
+                f"Read this repo via the web UI at https://tangled.org/{owner}, "
+                f"or run tg from an environment with open HTTP egress."
+            )
+        raise
     return [_repo_record_to_dict(owner, did, r["uri"], r["value"]) for r in records]
 
 
