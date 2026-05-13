@@ -167,6 +167,26 @@ For ongoing pushes after creation, do them from a machine with SSH egress
 public key once via `tg ssh-key add ~/.ssh/id_ed25519.pub` from any
 authenticated session.
 
+### Working style: don't re-narrate this
+
+The SSH-blocked + patch-based-PR shape above is **the design**, not a
+workaround discovered fresh each session. When contributing to a Tangled
+repo from CCotw:
+
+- Default to `tg pr create --from <branch> --base <base> --title ...`.
+  It generates the patch with `git format-patch`, gzips it, uploads as a
+  PDS blob, and writes the `sh.tangled.repo.pull` record. No SSH needed.
+- Don't re-explain the port-22 block to the user, don't apologize for
+  not pushing the branch, don't ask "should we do patch-based instead?"
+  — just file the PR.
+- The local branch in the spoke checkout is a scaffold for
+  `git format-patch`. Once the patch is uploaded, the branch can be
+  deleted; the PR record carries its own copy of the patch.
+
+Same principle for anything else documented in this file: treat it as
+ambient context. If you find yourself deriving a known constraint live,
+that's a signal to re-read CLAUDE.md, not to belabor the discovery.
+
 ### Upstream bug to know about
 
 `sh.tangled.repo.delete` cleans up `repo_keys` but not `repo_aliases`. After
