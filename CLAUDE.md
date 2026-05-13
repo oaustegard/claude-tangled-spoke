@@ -139,6 +139,9 @@ Tangled requires SSH, **`boot.sh` does not set up SSH at all**: previous
 versions installed a key and a global `url.git@tangled.org:.insteadOf
 https://tangled.org/` rule that actively broke read-only HTTPS clones
 (the rewrite forced every clone through port 22, which then failed).
+`boot.sh` now also defensively removes that rule from `--global` config on
+every run, so containers that were provisioned by an older boot get
+healed on their next session start.
 
 Net effect of the current boot:
 

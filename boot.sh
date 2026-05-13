@@ -28,6 +28,12 @@ for i in 1 2 3 4; do
     sleep $((i * 2))
 done
 
+# ── Strip legacy git config that breaks HTTPS clones ──
+# Pre-45bc234 boots installed `url.git@tangled.org:.insteadof=https://tangled.org/`
+# globally to force pushes over SSH. CCotw blocks port 22, so the rewrite turns
+# every read-only clone into a failing SSH attempt. Remove it if present.
+git config --global --unset-all url.git@tangled.org:.insteadof 2>/dev/null || true
+
 # ── Install tg ──
 TG_BIN="$PROJECT_DIR/bin/tg"
 if [ -x "$TG_BIN" ]; then
@@ -35,7 +41,7 @@ if [ -x "$TG_BIN" ]; then
     ln -sf "$TG_BIN" /usr/local/bin/tg 2>/dev/null || sudo ln -sf "$TG_BIN" /usr/local/bin/tg
     summary "✓ tg linked from $TG_BIN"
 else
-    summary "⚠ $TG_BIN not found — `tg` CLI unavailable"
+    summary "⚠ $TG_BIN not found — 'tg' CLI unavailable"
 fi
 
 # ── Auth login ──
@@ -47,7 +53,7 @@ if [ -n "${ATPROTO_HANDLE:-}" ] && [ -n "${ATPROTO_APP_PASSWORD:-}" ]; then
         summary "⚠ tg auth login failed — check ATPROTO_HANDLE/ATPROTO_APP_PASSWORD"
     fi
 else
-    summary "⚠ ATPROTO_HANDLE or ATPROTO_APP_PASSWORD missing — `tg` will be unauthenticated"
+    summary "⚠ ATPROTO_HANDLE or ATPROTO_APP_PASSWORD missing — 'tg' will be unauthenticated"
 fi
 
 # ── Print summary into Claude's context ──
