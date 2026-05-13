@@ -1,4 +1,4 @@
-# Claude Tangled and Spoke
+# Claude Tangled Spoke
 
 This repo is the **hub** — it configures your Claude Code on the Web session
 with authenticated access to [Tangled](https://tangled.org), the federated
@@ -115,7 +115,7 @@ denying it keeps Claude from reaching for it by mistake.
 ## Hosted on Tangled, mirrored to GitHub
 
 The source of truth for this repo is on Tangled at
-`tangled.org/oaustegard.bsky.social/claude-tangled-and-spoke` (or wherever
+`tangled.org/austegard.com/claude-tangled-spoke` (or wherever
 @oaustegard ends up — `tg repo list oaustegard.bsky.social` will tell you).
 GitHub holds a mirror so CCotw can clone it on first launch via HTTPS without
 needing SSH credentials pre-provisioned.

@@ -79,7 +79,7 @@ else
 fi
 
 # ── Print summary into Claude's context ──
-echo "── claude-tangled-and-spoke boot ──"
+echo "── claude-tangled-spoke boot ──"
 for line in "${SUMMARY_LINES[@]}"; do echo "  $line"; done
 echo ""
 echo "Try:  tg auth status   |   tg repo list   |   tg --help"

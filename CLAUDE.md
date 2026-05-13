@@ -1,4 +1,4 @@
-# Claude Tangled and Spoke
+# Claude Tangled Spoke
 
 This repo is the **hub** — it configures your Claude Code on the Web session
 with authenticated access to [Tangled](https://tangled.org), the federated

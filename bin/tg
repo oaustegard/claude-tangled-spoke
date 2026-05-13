@@ -54,7 +54,7 @@ NSID_PUBLIC_KEY    = "sh.tangled.publicKey"
 
 CONFIG_DIR  = Path(os.environ.get("TG_CONFIG_DIR", str(Path.home() / ".config" / "tg")))
 SESSION_PATH = CONFIG_DIR / "session.json"
-USER_AGENT  = "tg/0.1 (+https://github.com/oaustegard/claude-tangled-and-spoke)"
+USER_AGENT  = "tg/0.1 (+https://github.com/oaustegard/claude-tangled-spoke)"
 
 
 # ── HTTP / XRPC helpers ─────────────────────────────────────────────────────
@@ -394,6 +394,53 @@ def find_repo(owner: str, name: str) -> dict:
         if r["name"] == name:
             return r
     sys.exit(f"tg: repo {owner}/{name} not found")
+
+
+def get_service_auth(sess: Session, audience_did: str, lxm: str,
+                     ttl_seconds: int = 60) -> str:
+    """Mint a knot-bound service-auth JWT (com.atproto.server.getServiceAuth)."""
+    exp = int(time.time()) + ttl_seconds
+    out = with_refresh(sess, lambda: xrpc_get(
+        sess.pds, "com.atproto.server.getServiceAuth",
+        params={"aud": audience_did, "lxm": lxm, "exp": exp},
+        token=sess.access_jwt))
+    return out["token"]
+
+
+def knot_create_repo(knot_host: str, service_token: str, *,
+                      name: str, rkey: str, default_branch: str | None) -> dict:
+    """POST sh.tangled.repo.create on the knot (returns {repoDid?})."""
+    body = {"name": name, "rkey": rkey}
+    if default_branch:
+        body["defaultBranch"] = default_branch
+    return xrpc_post(f"https://{knot_host}", "sh.tangled.repo.create",
+                     body=body, token=service_token)
+
+
+def cmd_repo_create(args: argparse.Namespace) -> int:
+    sess = Session.load()
+    knot = args.knot or DEFAULT_KNOT
+    rkey = new_tid()
+    knot_did = f"did:web:{knot}"
+    token = get_service_auth(sess, knot_did, "sh.tangled.repo.create",
+                             ttl_seconds=120)
+    create_out = knot_create_repo(knot, token, name=args.name, rkey=rkey,
+                                   default_branch=args.default_branch)
+    record = {
+        "$type": NSID_REPO, "name": args.name, "knot": knot,
+        "createdAt": now_rfc3339(),
+    }
+    if args.description:
+        record["description"] = args.description
+    if create_out.get("repoDid"):
+        record["repoDid"] = create_out["repoDid"]
+    put_out = put_record(sess, NSID_REPO, rkey, record)
+    repo = _repo_record_to_dict(sess.handle, sess.did, put_out["uri"], record)
+    print(f"Created: {repo['owner']}/{repo['name']}")
+    print(f"  URI:         {repo['uri']}")
+    print(f"  Clone (SSH): {repo['clone_ssh']}")
+    print(f"  Clone (HTTPS): {repo['clone_https']}")
+    return 0
 
 
 def cmd_repo_list(args: argparse.Namespace) -> int:
@@ -861,6 +908,13 @@ def build_parser() -> argparse.ArgumentParser:
     r_clone.add_argument("dir", nargs="?")
     r_clone.add_argument("--ssh", action="store_true", help="use ssh url (default: https)")
     r_clone.set_defaults(func=cmd_repo_clone)
+    r_create = repo.add_parser("create",
+        help="create a new repo on a Tangled knot (default: knot1.tangled.sh)")
+    r_create.add_argument("name", help="repo name (without owner prefix)")
+    r_create.add_argument("--description", default="")
+    r_create.add_argument("--default-branch", default="main")
+    r_create.add_argument("--knot", help=f"knot host (default: {DEFAULT_KNOT})")
+    r_create.set_defaults(func=cmd_repo_create)
 
     issue = sub.add_parser("issue").add_subparsers(dest="sub", required=True)
     for name, fn in [("list", cmd_issue_list), ("view", cmd_issue_view),
