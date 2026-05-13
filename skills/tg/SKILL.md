@@ -98,3 +98,26 @@ prefer `tg pr create` (patch-based, HTTPS-only) for contributions.
   no clear instruction to act there.
 - `tg auth status` reports unauthenticated and no `*_APP_PASSWORD` is
   set — ask how they want to supply credentials.
+
+## Federation tax: self-hosted PDSes
+
+ATProto lets accounts host their own Personal Data Server (PDS) outside
+the central `bsky.network` infrastructure. `tg` resolves every read
+through the owner's PDS, so when that PDS isn't reachable from the
+current environment (e.g. a proxy with a host allowlist), reads fail.
+
+Concretely in proxied environments like claude.ai:
+
+- Repos owned by accounts on `*.bsky.network` or `*.tangled.sh` PDSes
+  work normally.
+- Repos owned by accounts with **self-hosted** PDSes (e.g. `mitchellh.com`
+  → `pds.mitchellh.com`) are not reachable. `tg` surfaces a clear error
+  naming the PDS host and pointing at the web UI fallback.
+- Self-hosted **contributors** (issue authors, commenters) on an
+  otherwise-reachable repo are gracefully skipped — listings still
+  succeed without that author's records.
+
+If you hit a self-hosted-PDS owner, the fallbacks are: read via the web
+UI at `https://tangled.org/<owner>/<repo>`, or run `tg` from an
+environment with open HTTP egress (e.g. a Claude Code on the Web
+container).
