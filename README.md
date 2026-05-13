@@ -58,7 +58,18 @@ expects spokes to live under the hub workspace.
 
 ## Setup
 
-1. Fork or clone this repo.
+Claude Code on the Web boots sessions from a **GitHub-hosted** repo — it
+doesn't read Tangled, GitLab, or any other forge for its workspace — so the
+hub itself has to live on GitHub even though the work it configures targets
+Tangled. The Tangled mirror linked at the bottom of this README is a publish
+target; you can't start a CCotw session from it.
+
+1. **Use this template.** Click the green "Use this template → Create a new
+   repository" button at the top of
+   [github.com/oaustegard/claude-tangled-spoke](https://github.com/oaustegard/claude-tangled-spoke)
+   to spin up your own copy under your account. (A regular fork also works,
+   but a template gives you a clean history and no upstream-tracking
+   relationship — better for a personal config repo you'll customize.)
 2. Create a `.env` file (gitignored) with your ATProto credentials:
    ```
    ATPROTO_HANDLE=alice.bsky.social
@@ -66,7 +77,7 @@ expects spokes to live under the hub workspace.
    ```
    Get an app password at https://bsky.app/settings/app-passwords — it's a
    revocable per-app credential, never use your main password.
-3. Open the repo in Claude Code on the Web.
+3. Open **your** new repo in Claude Code on the Web.
 4. The `SessionStart` hook runs `boot.sh` automatically.
 
 `boot.sh` does not install SSH keys — CCotw blocks outbound port 22, so a
