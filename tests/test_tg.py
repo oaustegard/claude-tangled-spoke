@@ -80,6 +80,66 @@ class NormalizeStateTests(unittest.TestCase):
         self.assertEqual(tg._normalize_state("", tg.NSID_PULL_STATUS), "open")
 
 
+class XrpcPostBodyShapeTests(unittest.TestCase):
+    """`com.atproto.server.refreshSession` rejects any request body, so
+    `xrpc_post(..., body=None)` must send no payload and no Content-Type."""
+
+    def _capture(self, body):
+        seen = {}
+
+        def fake_request(method, url, *, headers=None, data=None, timeout=30.0):
+            seen["method"] = method
+            seen["headers"] = dict(headers or {})
+            seen["data"] = data
+            return 200, b'{"ok":true}', {}
+
+        with mock.patch.object(tg, "_request", side_effect=fake_request):
+            tg.xrpc_post("https://pds.example", "com.atproto.server.refreshSession",
+                         body=body, token="R")
+        return seen
+
+    def test_body_none_sends_no_payload_or_content_type(self):
+        seen = self._capture(None)
+        self.assertIsNone(seen["data"])
+        self.assertNotIn("Content-Type", seen["headers"])
+        self.assertEqual(seen["headers"].get("Authorization"), "Bearer R")
+
+    def test_body_dict_sends_json_payload(self):
+        seen = self._capture({"foo": "bar"})
+        self.assertEqual(json.loads(seen["data"]), {"foo": "bar"})
+        self.assertEqual(seen["headers"].get("Content-Type"), "application/json")
+
+
+class CmdAuthRefreshTests(unittest.TestCase):
+    """Regression: `tg auth refresh` used to POST `body={}`, which the PDS
+    rejects with `InvalidRequest: A request body was provided when none was
+    expected`. The fix routes through `body=None`."""
+
+    def test_refresh_posts_no_body_and_rotates_tokens(self):
+        sess = tg.Session(did="did:plc:abc", handle="alice.bsky.social",
+                          pds="https://pds.example",
+                          access_jwt="OLD-A", refresh_jwt="OLD-R")
+        calls = []
+
+        def fake_xrpc_post(host, method, *, body, token=None,
+                           content_type="application/json"):
+            calls.append((host, method, body, token))
+            self.assertEqual(method, "com.atproto.server.refreshSession")
+            self.assertIsNone(body)
+            self.assertEqual(token, "OLD-R")
+            return {"accessJwt": "NEW-A", "refreshJwt": "NEW-R"}
+
+        with mock.patch.object(tg.Session, "load", return_value=sess), \
+             mock.patch.object(tg.Session, "save", autospec=True) as save, \
+             mock.patch.object(tg, "xrpc_post", side_effect=fake_xrpc_post):
+            rc = tg.cmd_auth_refresh(argparse.Namespace())
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sess.access_jwt, "NEW-A")
+        self.assertEqual(sess.refresh_jwt, "NEW-R")
+        save.assert_called_once()
+
+
 class SplitRepoTests(unittest.TestCase):
     def test_owner_and_name(self):
         self.assertEqual(

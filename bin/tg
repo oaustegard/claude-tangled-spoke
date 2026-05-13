@@ -109,16 +109,22 @@ def xrpc_get(host: str, method: str, *, params: dict[str, Any] | None = None,
     return json.loads(body) if body else {}
 
 
-def xrpc_post(host: str, method: str, *, body: dict | bytes,
+def xrpc_post(host: str, method: str, *, body: dict | bytes | None,
               token: str | None = None,
               content_type: str = "application/json") -> dict:
     url = f"{host.rstrip('/')}/xrpc/{method}"
-    headers = {"Accept": "application/json", "Content-Type": content_type}
+    headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    if isinstance(body, dict):
+    if body is None:
+        # com.atproto.server.refreshSession (and similar bodyless POSTs) reject
+        # a request body outright; omit Content-Type as well as the payload.
+        data = None
+    elif isinstance(body, dict):
+        headers["Content-Type"] = content_type
         data = json.dumps(body).encode()
     else:
+        headers["Content-Type"] = content_type
         data = body
     status, resp_body, _ = _request("POST", url, headers=headers, data=data)
     if status >= 400:
@@ -244,7 +250,7 @@ def cmd_auth_status(_: argparse.Namespace) -> int:
 
 def cmd_auth_refresh(_: argparse.Namespace) -> int:
     sess = Session.load()
-    out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body={},
+    out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body=None,
                     token=sess.refresh_jwt)
     sess.access_jwt = out["accessJwt"]
     sess.refresh_jwt = out["refreshJwt"]
@@ -265,7 +271,7 @@ def with_refresh(sess: Session, fn):
     except XRPCError as e:
         if e.status != 401:
             raise
-        out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body={},
+        out = xrpc_post(sess.pds, "com.atproto.server.refreshSession", body=None,
                         token=sess.refresh_jwt)
         sess.access_jwt = out["accessJwt"]
         sess.refresh_jwt = out["refreshJwt"]
