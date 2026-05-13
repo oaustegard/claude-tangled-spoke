@@ -192,19 +192,33 @@ class ListReposMockedTests(unittest.TestCase):
 
 
 class ListRepoIssuesMockedTests(unittest.TestCase):
-    def test_filters_and_numbers(self):
-        # Two issues, one closed via a state record.
-        backlinks_call_count = {"n": 0}
+    def _fake_repo(self):
+        return {
+            "uri": "at://did:plc:a/sh.tangled.repo/repo1",
+            "repo_did": "did:plc:knothost",
+            "owner": "alice", "owner_did": "did:plc:a", "name": "demo",
+        }
+
+    def test_filters_and_dedupes_across_targets(self):
+        # New records' .repo points at the Knot DID; legacy records point at
+        # the repo at-uri. list_repo_issues must query both and dedupe so old
+        # and new issues surface together without duplicates.
+        targets_queried = []
 
         def fake_constellation(target, collection, path, **kw):
-            backlinks_call_count["n"] += 1
             if collection == tg.NSID_ISSUE:
-                return [
-                    {"did": "did:plc:a", "collection": collection, "rkey": "x1"},
-                    {"did": "did:plc:a", "collection": collection, "rkey": "x2"},
-                ]
+                targets_queried.append(target)
+                if target == "did:plc:knothost":
+                    # New-format record only
+                    return [{"did": "did:plc:a", "collection": collection, "rkey": "x1"}]
+                if target.startswith("at://"):
+                    # Both records appear under the at-uri target (x1 from
+                    # legacy migration, x2 is a pure-legacy record).
+                    return [
+                        {"did": "did:plc:a", "collection": collection, "rkey": "x1"},
+                        {"did": "did:plc:a", "collection": collection, "rkey": "x2"},
+                    ]
             if collection == tg.NSID_ISSUE_STATE:
-                # The first issue (x1) has a closed state record; the second doesn't.
                 if target.endswith("/x1"):
                     return [{"did": "did:plc:a",
                              "collection": tg.NSID_ISSUE_STATE, "rkey": "s1"}]
@@ -227,12 +241,15 @@ class ListRepoIssuesMockedTests(unittest.TestCase):
              mock.patch.object(tg, "resolve_did_pds",
                                return_value="https://pds.example"), \
              mock.patch.object(tg, "get_record", side_effect=fake_get_record):
-            issues = tg.list_repo_issues("at://did:plc:a/sh.tangled.repo/repo1")
+            issues = tg.list_repo_issues(self._fake_repo())
 
+        # Both targets were queried.
+        issue_targets = [t for t in targets_queried]
+        self.assertIn("did:plc:knothost", issue_targets)
+        self.assertIn("at://did:plc:a/sh.tangled.repo/repo1", issue_targets)
+        # x1 returned from both queries but appears once.
         self.assertEqual([i["title"] for i in issues], ["First", "Second"])
         self.assertEqual([i["state"] for i in issues], ["closed", "open"])
-        # No fake sequential `number` field — identity comes from rkey/uri.
-        # (Tangled's canonical issue numbers come from AppView, not records.)
         for i in issues:
             self.assertNotIn("number", i)
             self.assertTrue(i["uri"].startswith("at://"))
@@ -319,19 +336,28 @@ class IssueCreateMockedTests(unittest.TestCase):
             rc = tg.cmd_issue_create(argv)
         return rc, written
 
-    def test_includes_repo_did(self):
-        # The crux: AppView won't ingest the issue without repoDid on the record.
+    def test_repo_field_is_knot_did(self):
+        # Per the canonical lexicon, `sh.tangled.repo.issue.repo` is
+        # `format: "did"` — the Knot's DID, NOT the repo at-uri. AppView's
+        # ingester rejects at-uri values via syntax.ParseDID.
         rc, written = self._run_create(self._fake_repo())
         self.assertEqual(rc, 0)
-        self.assertEqual(written["record"]["repoDid"], "did:plc:knothost")
-        self.assertEqual(written["record"]["repo"],
-                         "at://did:plc:owner/sh.tangled.repo/r1")
+        self.assertEqual(written["record"]["repo"], "did:plc:knothost")
         self.assertEqual(written["record"]["title"], "hi")
 
-    def test_omits_repo_did_when_absent(self):
-        rc, written = self._run_create(self._fake_repo(repo_did=""))
+    def test_no_repodid_companion_field(self):
+        # The old companion `repoDid` field is never read by AppView's
+        # ingester (IssueFromRecord pulls RepoDid from record.Repo). Don't
+        # waste bytes on it.
+        rc, written = self._run_create(self._fake_repo())
         self.assertEqual(rc, 0)
         self.assertNotIn("repoDid", written["record"])
+
+    def test_exits_when_repo_has_no_did(self):
+        # Without a Knot DID we can't write a valid record — fail loudly
+        # rather than ship a record AppView will silently drop.
+        with self.assertRaises(SystemExit):
+            self._run_create(self._fake_repo(repo_did=""))
 
 
 class IdentifierHelperTests(unittest.TestCase):

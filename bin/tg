@@ -539,10 +539,26 @@ def _issue_state(issue_uri: str, constellation: str) -> str:
     return _normalize_state(rec.get("value", {}).get("state", "open"), NSID_ISSUE_STATE)
 
 
-def list_repo_issues(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
+def list_repo_issues(repo: dict, constellation: str = DEFAULT_CONSTELLATION,
                      limit: int = 50) -> list[dict]:
-    links = constellation_links(repo_uri, NSID_ISSUE, ".repo", limit=limit,
-                                constellation=constellation)
+    # The canonical `.repo` value on new issue records is the Knot's DID;
+    # legacy records (pre-add-repo-did migration) point at the repo at-uri.
+    # Query both targets and dedupe so we surface old and new records alike.
+    targets = []
+    if repo.get("repo_did"):
+        targets.append(repo["repo_did"])
+    if repo.get("uri"):
+        targets.append(repo["uri"])
+    seen = set()
+    links = []
+    for target in targets:
+        for link in constellation_links(target, NSID_ISSUE, ".repo", limit=limit,
+                                         constellation=constellation):
+            key = (link["did"], link["rkey"])
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(link)
     out = []
     for link in links:
         try:
@@ -579,7 +595,7 @@ def _rkey_from_uri(uri: str) -> str:
 
 def cmd_issue_list(args: argparse.Namespace) -> int:
     repo = _resolve_repo(args.repo)
-    issues = list_repo_issues(repo["uri"], limit=args.limit)
+    issues = list_repo_issues(repo, limit=args.limit)
     if args.state and args.state != "all":
         issues = [i for i in issues if i["state"] == args.state]
     if args.json:
@@ -596,7 +612,7 @@ def cmd_issue_list(args: argparse.Namespace) -> int:
 
 def _resolve_issue(repo: dict, ident: str) -> dict:
     """Resolve an issue by at-uri or by rkey (the trailing path component)."""
-    issues = list_repo_issues(repo["uri"], limit=200)
+    issues = list_repo_issues(repo, limit=200)
     if ident.startswith("at://"):
         for i in issues:
             if i["uri"] == ident:
@@ -640,14 +656,17 @@ def cmd_issue_create(args: argparse.Namespace) -> int:
     sess = Session.load()
     repo = _resolve_repo(args.repo)
     body = args.body or (sys.stdin.read() if not sys.stdin.isatty() else "")
+    # `sh.tangled.repo.issue.repo` is `format: "did"` per the canonical lexicon
+    # — store the Knot's repoDid directly. AppView's ingester rejects at-uri
+    # values via syntax.ParseDID (see tangled.org/core/appview/ingester.go).
+    # Old at-uri-form records survive only via the offline add-repo-did
+    # backfill migration; new records must use the DID.
+    if not repo.get("repo_did"):
+        sys.exit(f"tg: repo {args.repo} has no repoDid — cannot create issue")
     record = {
-        "$type": NSID_ISSUE, "repo": repo["uri"], "title": args.title,
+        "$type": NSID_ISSUE, "repo": repo["repo_did"], "title": args.title,
         "createdAt": now_rfc3339(),
     }
-    # AppView routes issues to a repo by the Knot's repoDid; without it the
-    # record is invisible to the web UI even though Constellation indexes it.
-    if repo.get("repo_did"):
-        record["repoDid"] = repo["repo_did"]
     if body:
         record["body"] = body
     out = create_record(sess, NSID_ISSUE, record)
@@ -699,10 +718,25 @@ def _pull_status(pull_uri: str, constellation: str) -> str:
     return _normalize_state(rec.get("value", {}).get("status", "open"), NSID_PULL_STATUS)
 
 
-def list_repo_pulls(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
+def list_repo_pulls(repo: dict, constellation: str = DEFAULT_CONSTELLATION,
                     limit: int = 50) -> list[dict]:
-    links = constellation_links(repo_uri, NSID_PULL, ".target.repo", limit=limit,
-                                constellation=constellation)
+    # Same dual-target query as issues: new pull records put the Knot DID in
+    # `target.repo`; legacy records put the repo at-uri there.
+    targets = []
+    if repo.get("repo_did"):
+        targets.append(repo["repo_did"])
+    if repo.get("uri"):
+        targets.append(repo["uri"])
+    seen = set()
+    links = []
+    for target in targets:
+        for link in constellation_links(target, NSID_PULL, ".target.repo",
+                                         limit=limit, constellation=constellation):
+            key = (link["did"], link["rkey"])
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(link)
     out = []
     for link in links:
         try:
@@ -732,7 +766,7 @@ def list_repo_pulls(repo_uri: str, constellation: str = DEFAULT_CONSTELLATION,
 
 def cmd_pr_list(args: argparse.Namespace) -> int:
     repo = _resolve_repo(args.repo)
-    pulls = list_repo_pulls(repo["uri"], limit=args.limit)
+    pulls = list_repo_pulls(repo, limit=args.limit)
     if args.status and args.status != "all":
         pulls = [p for p in pulls if p["status"] == args.status]
     if args.json:
@@ -750,7 +784,7 @@ def cmd_pr_list(args: argparse.Namespace) -> int:
 
 def _resolve_pull(repo: dict, ident: str) -> dict:
     """Resolve a pull by at-uri or by rkey."""
-    pulls = list_repo_pulls(repo["uri"], limit=200)
+    pulls = list_repo_pulls(repo, limit=200)
     if ident.startswith("at://"):
         for p in pulls:
             if p["uri"] == ident:
@@ -858,17 +892,20 @@ def cmd_pr_create(args: argparse.Namespace) -> int:
     gz = gzip.compress(patch_text.encode())
     blob = upload_blob(sess, gz, "application/gzip")
     now = now_rfc3339()
+    # Per the canonical lexicon, both `target.repo` and `source.repo` are
+    # `format: "did"` — store the Knot's repoDid, not the repo at-uri.
+    if not repo.get("repo_did"):
+        sys.exit(f"tg: repo {args.repo} has no repoDid — cannot create pull")
+    repo_did = repo["repo_did"]
     record = {
         "$type": NSID_PULL, "title": title, "createdAt": now,
-        "target": {"repo": repo["uri"], "branch": args.base or "main"},
+        "target": {"repo": repo_did, "branch": args.base or "main"},
         "rounds": [{"createdAt": now, "patchBlob": blob}],
     }
     if body:
         record["body"] = body
     if args.from_branch:
-        record["source"] = {"repo": repo["uri"], "branch": args.from_branch}
-    if repo.get("repo_did"):
-        record["target"]["repoDid"] = repo["repo_did"]
+        record["source"] = {"repo": repo_did, "branch": args.from_branch}
     out = create_record(sess, NSID_PULL, record, rkey=new_tid())
     print(f"Pull created: {out['uri']}")
     print(f"  → https://tangled.org/@{repo['owner']}/{repo['name']}/pulls")
