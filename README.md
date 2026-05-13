@@ -11,10 +11,12 @@ for the ATProto developer base.
 
 After session start, your CCotw session has:
 
-- **`git` over SSH** to Tangled — `git clone`, `push`, `pull` against any
-  `tangled.org` repo your SSH key can reach
 - **`tg` CLI** — authenticated against your PDS via an ATProto app password,
   with subcommands for `auth`, `repo`, `issue`, `pr`, and `ssh-key`
+- **HTTPS git clone** of any public `tangled.org` repo — `git clone https://tangled.org/<owner>/<name>`
+  works read-only; no SSH plumbing in the container (CCotw blocks port 22,
+  so SSH wouldn't work anyway — contribute via patch-based PRs with
+  `tg pr create`)
 - **MCP GitHub server denied** — this session is Tangled-focused; the
   built-in GitHub MCP only sees this hub repo anyway
 
@@ -64,11 +66,13 @@ expects spokes to live under the hub workspace.
    ```
    Get an app password at https://bsky.app/settings/app-passwords — it's a
    revocable per-app credential, never use your main password.
-3. (Optional) Drop an SSH private key at `.ssh/id_ed25519` *inside the hub repo*
-   (also gitignored) — needed for git push to Tangled. Register the matching
-   public key via `tg ssh-key add ~/.ssh/id_ed25519.pub` once logged in.
-4. Open the repo in Claude Code on the Web.
-5. The `SessionStart` hook runs `boot.sh` automatically.
+3. Open the repo in Claude Code on the Web.
+4. The `SessionStart` hook runs `boot.sh` automatically.
+
+`boot.sh` does not install SSH keys — CCotw blocks outbound port 22, so a
+key there wouldn't help anyway. If you need `git push` to Tangled from a
+machine with SSH egress (laptop, GHA runner), manage `~/.ssh` there and
+register the public key once via `tg ssh-key add ~/.ssh/id_ed25519.pub`.
 
 ## Coverage
 
