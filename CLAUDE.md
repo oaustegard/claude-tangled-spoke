@@ -111,16 +111,30 @@ denying it (`.claude/settings.json`) keeps Claude from reaching for it.
 
 ## CCotw networking quirk: SSH egress is blocked
 
-CCotw containers can reach tangled.org on port 443 (HTTPS) but **not on
-port 22**. Tangled refuses HTTPS push (`Pushes are only supported over
-SSH.`), so the implication is:
+CCotw containers reach tangled.org on 443 (HTTPS) but **not on port 22**.
+This is a blanket Anthropic egress rule — `github.com:22` and
+`gitlab.com:22` are blocked too, not just Tangled. Net effect:
 
 - ✓ `tg repo list/view/create/clone` — fine (all HTTPS/XRPC)
 - ✓ `tg issue/pr` reads and writes — fine (XRPC to PDS)
-- ✓ `git clone https://tangled.org/...` — fine (read-only)
-- ✗ `git push` to a Tangled remote — fails (port 22 blocked)
+- ✓ `git clone https://tangled.org/...` — fine (read-only HTTPS)
+- ✓ `tg repo create --source <url>` — **the knot pulls from the URL**
+  server-side over HTTPS, no SSH required from CCotw. Tested with GitHub.
+- ✗ `git push` to a Tangled remote from CCotw — fails (port 22 blocked)
 
-If you need to push code to a Tangled repo, do it from a machine with
-SSH egress. The Tangled repo for this hub already exists at
-[austegard.com/claude-tangled-spoke](https://tangled.org/austegard.com/claude-tangled-spoke);
-mirror pushes happen from outside the container.
+For populating a Tangled repo from CCotw, use `--source`:
+
+```bash
+tg repo create my-mirror --source https://github.com/me/my-repo.git
+```
+
+For ongoing pushes after creation, do them from a machine with SSH egress
+(your laptop or a GitHub Action with an SSH key secret).
+
+### Upstream bug to know about
+
+`sh.tangled.repo.delete` cleans up `repo_keys` but not `repo_aliases`. After
+a delete, recreating with the same name leaves the new bare repo orphaned
+(reachable on disk at `scanPath/<new-repoDid>` but not findable via the
+HTTP routing). Workaround: pick a fresh name. See the issue we filed
+upstream against `tangled.org/tangled.org/core`.

@@ -408,11 +408,20 @@ def get_service_auth(sess: Session, audience_did: str, lxm: str,
 
 
 def knot_create_repo(knot_host: str, service_token: str, *,
-                      name: str, rkey: str, default_branch: str | None) -> dict:
-    """POST sh.tangled.repo.create on the knot (returns {repoDid?})."""
-    body = {"name": name, "rkey": rkey}
+                      name: str, rkey: str, default_branch: str | None,
+                      source: str | None = None) -> dict:
+    """POST sh.tangled.repo.create on the knot (returns {repoDid?}).
+
+    When `source` is set the knot runs `git clone --bare <source>` server-side
+    instead of `git init --bare`. That's how CCotw mirrors GitHub repos to
+    Tangled despite the container's port-22 egress block — the knot fetches
+    over HTTPS on our behalf.
+    """
+    body: dict = {"name": name, "rkey": rkey}
     if default_branch:
         body["defaultBranch"] = default_branch
+    if source:
+        body["source"] = source
     return xrpc_post(f"https://{knot_host}", "sh.tangled.repo.create",
                      body=body, token=service_token)
 
@@ -425,7 +434,8 @@ def cmd_repo_create(args: argparse.Namespace) -> int:
     token = get_service_auth(sess, knot_did, "sh.tangled.repo.create",
                              ttl_seconds=120)
     create_out = knot_create_repo(knot, token, name=args.name, rkey=rkey,
-                                   default_branch=args.default_branch)
+                                   default_branch=args.default_branch,
+                                   source=args.source)
     record = {
         "$type": NSID_REPO, "name": args.name, "knot": knot,
         "createdAt": now_rfc3339(),
@@ -440,6 +450,8 @@ def cmd_repo_create(args: argparse.Namespace) -> int:
     print(f"  URI:         {repo['uri']}")
     print(f"  Clone (SSH): {repo['clone_ssh']}")
     print(f"  Clone (HTTPS): {repo['clone_https']}")
+    if args.source:
+        print(f"  Source:      {args.source} (cloned server-side)")
     return 0
 
 
@@ -914,6 +926,10 @@ def build_parser() -> argparse.ArgumentParser:
     r_create.add_argument("--description", default="")
     r_create.add_argument("--default-branch", default="main")
     r_create.add_argument("--knot", help=f"knot host (default: {DEFAULT_KNOT})")
+    r_create.add_argument("--source",
+        help="URL to clone from server-side (e.g. https://github.com/u/r.git). "
+             "The knot runs `git clone --bare <source>` itself — works around "
+             "CCotw's port-22 egress block when mirroring GitHub repos.")
     r_create.set_defaults(func=cmd_repo_create)
 
     issue = sub.add_parser("issue").add_subparsers(dest="sub", required=True)

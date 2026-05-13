@@ -114,24 +114,46 @@ denying it keeps Claude from reaching for it by mistake.
 
 ## Hosted on Tangled, mirrored to GitHub
 
-Source of truth: [tangled.org/austegard.com/claude-tangled-spoke](https://tangled.org/austegard.com/claude-tangled-spoke).
-GitHub mirror: [github.com/oaustegard/claude-tangled-spoke](https://github.com/oaustegard/claude-tangled-spoke).
+- GitHub: [github.com/oaustegard/claude-tangled-spoke](https://github.com/oaustegard/claude-tangled-spoke) — source of truth
+- Tangled: [austegard.com/claude-tangled-spoke-mirror](https://tangled.org/austegard.com/claude-tangled-spoke-mirror) — Tangled mirror, populated server-side from GitHub via the knot's `source` parameter
 
-CCotw clones from the GitHub mirror at session start (no SSH key needed for
-read-only HTTPS). Edit on GitHub, push to GitHub, then mirror to Tangled
-from a machine with SSH egress:
+### How the mirror got there from CCotw (no SSH needed)
+
+Anthropic's CCotw container blocks outbound port 22 (a blanket egress rule, not
+Tangled-specific), and Tangled refuses HTTPS push. That sounds like a dead end
+for `git push` to Tangled, but Tangled's `sh.tangled.repo.create` lexicon
+accepts an optional `source` URL — the knot does the `git clone --bare`
+server-side over HTTPS on our behalf:
 
 ```bash
-git clone https://github.com/oaustegard/claude-tangled-spoke
-cd claude-tangled-spoke
-git remote add tangled [email protected]:austegard.com/claude-tangled-spoke
-git push tangled main
+# from CCotw, after `tg auth login`:
+tg repo create my-mirror \
+    --source https://github.com/me/my-repo.git \
+    --description "Server-side mirror"
 ```
 
-**Why not push to Tangled from CCotw?** Anthropic's CCotw container blocks
-outbound port 22. Tangled refuses HTTPS push (SSH-only). All other Tangled
-operations work fine from CCotw — repo/issue/PR via XRPC over 443, clones
-over HTTPS. Only `git push` to Tangled is affected.
+The knot fetches the URL itself, populates the bare repo, and assigns a fresh
+repoDid. All operations stay over port 443.
+
+**Caveat (upstream bug — [tangled.org/core issue ⟨tbd⟩](#)):** if you delete a
+Tangled repo and recreate one with the same name, the new bare repo gets
+orphaned behind a stale alias row — `repo.delete` cleans up `repo_keys` but not
+`repo_aliases`, and `INSERT...ON CONFLICT DO NOTHING` then prevents the alias
+from updating. Workaround: re-create with a different name (the reason this
+mirror is named `claude-tangled-spoke-mirror` rather than the bare repo name).
+
+### Updating the mirror
+
+Since the knot only clones once on create, mirror updates need a second pass.
+Either:
+
+- One-off `git push` from a machine with SSH egress (your laptop):
+  ```bash
+  git remote add tangled [email protected]:austegard.com/claude-tangled-spoke-mirror
+  git push tangled main
+  ```
+- A GitHub Actions workflow on `oaustegard/claude-tangled-spoke` that mirrors to
+  Tangled on each push to `main` (e.g. the [Push to tangled.org](https://github.com/marketplace/actions/push-to-tangled-org) marketplace action with an SSH key as a repo secret).
 
 ## Acknowledgments
 

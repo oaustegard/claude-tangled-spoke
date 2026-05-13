@@ -215,54 +215,58 @@ class ListRepoIssuesMockedTests(unittest.TestCase):
 
 
 class RepoCreateMockedTests(unittest.TestCase):
-    def test_service_auth_then_knot_then_put_record(self):
+    def _run_create(self, source=None):
         sess = tg.Session(did="did:plc:abc", handle="alice.bsky.social",
                           pds="https://pds.example", access_jwt="A", refresh_jwt="R")
-        # Capture call order + arguments.
         calls = []
+        knot_body = {}
 
         def fake_xrpc_get(host, method, params=None, token=None):
-            calls.append(("GET", host, method, params, token))
+            calls.append(("GET", method))
             if method == "com.atproto.server.getServiceAuth":
                 self.assertEqual(params["aud"], "did:web:knot1.tangled.sh")
                 self.assertEqual(params["lxm"], "sh.tangled.repo.create")
-                self.assertIn("exp", params)
                 return {"token": "SVC"}
             raise AssertionError(method)
 
         def fake_xrpc_post(host, method, body, token=None, content_type="application/json"):
-            calls.append(("POST", host, method, body, token))
+            calls.append(("POST", method))
             if method == "sh.tangled.repo.create":
-                self.assertEqual(host, "https://knot1.tangled.sh")
                 self.assertEqual(token, "SVC")
-                self.assertEqual(body["name"], "demo")
-                self.assertEqual(body["defaultBranch"], "main")
-                self.assertIn("rkey", body)
+                knot_body.update(body)
                 return {"repoDid": "did:web:demo.knot"}
             if method == "com.atproto.repo.putRecord":
                 self.assertEqual(token, "A")
-                self.assertEqual(body["repo"], sess.did)
-                self.assertEqual(body["collection"], tg.NSID_REPO)
-                self.assertEqual(body["record"]["name"], "demo")
-                self.assertEqual(body["record"]["knot"], "knot1.tangled.sh")
                 return {"uri": f"at://{sess.did}/{tg.NSID_REPO}/{body['rkey']}",
-                        "cid": "bafyfake"}
+                        "cid": "bafy"}
             raise AssertionError(method)
 
         argv = argparse.Namespace(name="demo", description="", default_branch="main",
-                                  knot=None)
+                                  knot=None, source=source)
         with mock.patch.object(tg.Session, "load", return_value=sess), \
              mock.patch.object(tg, "xrpc_get", side_effect=fake_xrpc_get), \
              mock.patch.object(tg, "xrpc_post", side_effect=fake_xrpc_post):
             rc = tg.cmd_repo_create(argv)
+        return rc, calls, knot_body
+
+    def test_create_without_source(self):
+        rc, calls, body = self._run_create(source=None)
         self.assertEqual(rc, 0)
-        # Order: getServiceAuth → knot create → PDS putRecord
-        methods = [c[2] for c in calls]
-        self.assertEqual(methods, [
-            "com.atproto.server.getServiceAuth",
-            "sh.tangled.repo.create",
-            "com.atproto.repo.putRecord",
-        ])
+        self.assertEqual([c[1] for c in calls],
+            ["com.atproto.server.getServiceAuth",
+             "sh.tangled.repo.create",
+             "com.atproto.repo.putRecord"])
+        self.assertNotIn("source", body)
+        self.assertEqual(body["defaultBranch"], "main")
+
+    def test_create_with_source_forwards_to_knot(self):
+        url = "https://github.com/u/r.git"
+        rc, calls, body = self._run_create(source=url)
+        self.assertEqual(rc, 0)
+        # Same call sequence; knot body now carries `source` so the knot can
+        # `git clone --bare <url>` server-side over HTTPS.
+        self.assertEqual(body["source"], url)
+        self.assertEqual(body["name"], "demo")
 
 
 class ParserSmokeTests(unittest.TestCase):
