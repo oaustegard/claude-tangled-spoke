@@ -102,11 +102,25 @@ denying it (`.claude/settings.json`) keeps Claude from reaching for it.
 
 ## What's NOT here (use the Tangled web UI)
 
-- **Repo create** — needs `getServiceAuth` against the chosen Knot, then a
-  `sh.tangled.repo.create` call on the knot. Two-step flow not yet wired.
 - **PR merge / close / reopen** — `sh.tangled.repo.pull.status` records can
   be written, but AppView ingestion of those records is known-broken (see
   [tang issue #2](https://tangled.org/onev.cat/tang/issues/2)). The web UI
   remains the canonical place to merge.
 - **PR checkout** — straightforward `git fetch` of the source branch, but
   only works for branch-based PRs (not patch-only ones).
+
+## CCotw networking quirk: SSH egress is blocked
+
+CCotw containers can reach tangled.org on port 443 (HTTPS) but **not on
+port 22**. Tangled refuses HTTPS push (`Pushes are only supported over
+SSH.`), so the implication is:
+
+- ✓ `tg repo list/view/create/clone` — fine (all HTTPS/XRPC)
+- ✓ `tg issue/pr` reads and writes — fine (XRPC to PDS)
+- ✓ `git clone https://tangled.org/...` — fine (read-only)
+- ✗ `git push` to a Tangled remote — fails (port 22 blocked)
+
+If you need to push code to a Tangled repo, do it from a machine with
+SSH egress. The Tangled repo for this hub already exists at
+[austegard.com/claude-tangled-spoke](https://tangled.org/austegard.com/claude-tangled-spoke);
+mirror pushes happen from outside the container.

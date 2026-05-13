@@ -114,11 +114,24 @@ denying it keeps Claude from reaching for it by mistake.
 
 ## Hosted on Tangled, mirrored to GitHub
 
-The source of truth for this repo is on Tangled at
-`tangled.org/austegard.com/claude-tangled-spoke` (or wherever
-@oaustegard ends up — `tg repo list oaustegard.bsky.social` will tell you).
-GitHub holds a mirror so CCotw can clone it on first launch via HTTPS without
-needing SSH credentials pre-provisioned.
+Source of truth: [tangled.org/austegard.com/claude-tangled-spoke](https://tangled.org/austegard.com/claude-tangled-spoke).
+GitHub mirror: [github.com/oaustegard/claude-tangled-spoke](https://github.com/oaustegard/claude-tangled-spoke).
+
+CCotw clones from the GitHub mirror at session start (no SSH key needed for
+read-only HTTPS). Edit on GitHub, push to GitHub, then mirror to Tangled
+from a machine with SSH egress:
+
+```bash
+git clone https://github.com/oaustegard/claude-tangled-spoke
+cd claude-tangled-spoke
+git remote add tangled [email protected]:austegard.com/claude-tangled-spoke
+git push tangled main
+```
+
+**Why not push to Tangled from CCotw?** Anthropic's CCotw container blocks
+outbound port 22. Tangled refuses HTTPS push (SSH-only). All other Tangled
+operations work fine from CCotw — repo/issue/PR via XRPC over 443, clones
+over HTTPS. Only `git push` to Tangled is affected.
 
 ## Acknowledgments
 
